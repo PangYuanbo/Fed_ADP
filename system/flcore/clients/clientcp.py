@@ -370,10 +370,12 @@ class clientCP:
                         continue
 
                     # 分层计算阈值（例如每层选前 30% 的低曲率元素）
-                    thresh = torch.quantile(h_abs, 0.30).item()
+                    thresh_1 = torch.quantile(h_abs, 0.60).item()
+                    thresh_2 = torch.quantile(h_abs, 0.40).item()
 
                     # 构造 mask：True = 可加噪（低曲率）
-                    self.hess_mask[name] = (h.abs() <= thresh)
+                    self.hess_mask[name] = torch.logical_or(h.abs() >= thresh_1, h.abs() <= thresh_2)
+
 
                     # 可选调试输出
                     mask_ratio = self.hess_mask[name].float().mean().item()
@@ -406,7 +408,7 @@ class clientCP:
                     self.param_diff_test[name] = -self.learning_rate * grad
 
         # Clip and add noise for DP if enabled
-        clip_value=0.1
+        clip_value=0.005
         epsilon = 0.8
         delta = 1e-5
 
@@ -426,19 +428,19 @@ class clientCP:
              #复原参数
             for name, param in self.model.named_parameters():
                     param.data = self.inital_pra_dp[name].clone().detach()
-            with torch.enable_grad():
-                for x, y in self.public_data_loader:
-                    if type(x) == type([]):
-                        x[0] = x[0].to(self.device)
-                    else:
-                        x = x.to(self.device)
-                    y = y.to(self.device)
-                    output = self.model(x)
-                    loss = self.loss(output, y)
-                    self.opt.zero_grad()
-                    loss.backward()
-                    self.opt.step()
-                    break
+            # with torch.enable_grad():
+            #     for x, y in self.public_data_loader:
+            #         if type(x) == type([]):
+            #             x[0] = x[0].to(self.device)
+            #         else:
+            #             x = x.to(self.device)
+            #         y = y.to(self.device)
+            #         output = self.model(x)
+            #         loss = self.loss(output, y)
+            #         self.opt.zero_grad()
+            #         loss.backward()
+            #         self.opt.step()
+            #         break
 
 
             param_public_diff = {}
@@ -453,11 +455,12 @@ class clientCP:
                 norm_train = torch.norm(diff.abs())
                 norm_test = torch.norm(self.param_diff_test[ full_name].abs())
                 # 1) 计算 25% 分位数作为裁剪阈值
-                threshold = torch.quantile(diff.abs().view(-1), 0.3)
+                threshold_1 = torch.quantile(diff.abs().view(-1), 0.6)
+                threshold_2 = torch.quantile(diff.abs().view(-1), 0.4)
                 # threshold_test= torch.quantile(self.param_diff_test["feature_extractor."+full_name].abs().view(-1), 0.5)
                 # mask = (diff.abs() <= threshold) & (self.param_diff_test["feature_extractor." + full_name].abs() >= threshold_test)
                 # 旧 mask = (diff.abs() <= threshold)
-                core_mask = (diff.abs() <= threshold)
+                core_mask = torch.logical_or((diff.abs() >= threshold_1) , (diff.abs() <= threshold_2))
                 q = torch.quantile(param_public_diff[full_name].abs().view(-1), 0.5)
                 #
                 # # 放大函数：保证输入 ≥ ε，然后统一平方
@@ -497,13 +500,17 @@ class clientCP:
 
 
                 # -- (b) 加噪 --
-                noise_std_estimate = args.difference_privacy_number*clip_value*torch.sqrt(
-                    torch.tensor(2.0) * torch.log(torch.tensor(1.25 / delta)))/(len(trainloader)*epsilon)
+                # noise_std_estimate = args.difference_privacy_number*clip_value*torch.sqrt(
+                #     torch.tensor(2.0) * torch.log(torch.tensor(1.25 / delta)))/(len(trainloader)*epsilon)
+
+                noise_std_estimate = (clip_value / epsilon) * torch.sqrt(
+                    torch.tensor(2.0) * torch.log(torch.tensor(1.25 / delta))
+                )
                 noise = torch.normal(mean=0, std=noise_std_estimate, size=masked_diff.shape).to(diff.device)
                 masked_diff = masked_diff + noise
                 norm_masked_noisy = torch.norm(masked_diff.abs())
-                print(
-                    f"[{full_name}] noise_std={noise_std_estimate.item():.6f} | norm_noisy={norm_masked_noisy.item():.4f} vs norm_test={norm_test.item():.4f}")
+                # print(
+                #     f"[{full_name}] noise_std={noise_std_estimate.item():.6f} | norm_noisy={norm_masked_noisy.item():.4f} vs norm_test={norm_test.item():.4f}")
                 # 4) 写回原来的 diff
                 diff[core_mask] = masked_diff
                 param_diff[full_name] = diff
