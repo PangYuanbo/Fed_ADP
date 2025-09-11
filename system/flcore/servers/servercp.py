@@ -6,6 +6,7 @@ from flcore.clients.clientcp import *
 from utils.data_utils import read_client_data
 from threading import Thread
 import os
+from utils.mia_evaluator_simple import SimpleMIAEvaluator
 
 
 class FedCP:
@@ -55,6 +56,28 @@ class FedCP:
         self.Budget = []
         self.head = None
         self.cs = None
+        
+        # Initialize MIA evaluator if attack models are available
+        self.mia_evaluator = None
+        self.mia_evaluation_interval = 10  # Evaluate MIA every 10 rounds
+        self.enable_mia = getattr(args, 'enable_mia', False)  # Add flag to enable/disable MIA
+        
+        if self.enable_mia:
+            try:
+                self.mia_evaluator = SimpleMIAEvaluator(
+                    attack_model_dir="Membership_Inference_Attack",
+                    num_classes=args.num_classes,
+                    device=args.device,
+                    batch_size=1,  # Use batch_size=1 as in your original implementation
+                    evaluate_interval=10,  # Evaluate MIA every 10 rounds
+                    save_results=True,
+                    results_dir=f"mia_results/{args.dataset}",
+                    max_samples_per_label=50  # Limit to 50 samples per label for faster evaluation
+                )
+                print("[Server] MIA evaluator initialized successfully")
+            except Exception as e:
+                print(f"[Server] Warning: Could not initialize MIA evaluator: {e}")
+                self.mia_evaluator = None
 
 
     def select_clients(self):
@@ -153,18 +176,52 @@ class FedCP:
         else:
             filename = f"results_{args.dataset}_{args.global_rounds}_{args.local_learning_rate:.4f}.txt"
         file_path = os.path.join(result_dir, filename)
+        
+        # Initialize MIA results tracking
+        mia_results_history = []
+        
         for i in range(self.global_rounds+1):
             s_t = time.time()
             self.selected_clients = self.select_clients()
 
 
-            if i%self.eval_gap == 0:
+            # Print round info every round for better visibility
+            if i > 0:  # Skip round 0 for cleaner output
                 print(f"\n-------------Round number: {i}-------------")
-                print("\nEvaluate before local training")
+            
+            # Evaluate accuracy based on eval_gap setting
+            if i%self.eval_gap == 0:
+                if i > 0:  # Don't print "Evaluate before local training" for round 0
+                    print("\nEvaluate before local training")
                 self.evaluate()
 
                 with open(file_path, "a") as f:
                     f.write(f"Round {i}: ACC = {self.rs_test_acc[-1]:.4f}\n")
+                
+                # Print accuracy every eval_gap for console visibility
+                if i > 0:
+                    print(f"Round {i} - Test Accuracy: {self.rs_test_acc[-1]:.4f}")
+            elif i > 0:
+                # For non-eval rounds, still show progress but don't evaluate
+                print(f"Round {i} - Training...")
+                
+            # Evaluate MIA independently based on its own interval
+            if self.mia_evaluator and self.mia_evaluator.should_evaluate(i):
+                    print("\n[Server] Running MIA evaluation...")
+                    mia_results = self.mia_evaluator.evaluate_all_clients(
+                        self.clients,
+                        round_num=i,
+                        dataset_name=args.dataset,
+                        alpha=args.alpha
+                    )
+                    mia_results_history.append(mia_results)
+                    
+                    # Log MIA results alongside accuracy
+                    if 'average' in mia_results and mia_results['average']:
+                        avg = mia_results['average']
+                        with open(file_path, "a") as f:
+                            f.write(f"    MIA - Acc: {avg['accuracy']:.4f}, F1: {avg['f1_score']:.4f}, "
+                                   f"TPR: {avg['tpr']:.4f}, FPR: {avg['fpr']:.4f}\n")
 
 
             for client in self.selected_clients:
@@ -183,6 +240,22 @@ class FedCP:
         print("\nBest accuracy.")
         print(max(self.rs_test_acc))
         print(sum(self.Budget[1:])/len(self.Budget[1:]))
+        
+        # Print MIA evaluation summary if available
+        if self.mia_evaluator and mia_results_history:
+            print("\n========== MIA Evaluation Summary ==========")
+            summary = self.mia_evaluator.get_summary()
+            if 'error' not in summary:
+                print(f"Total rounds evaluated: {summary['total_rounds_evaluated']}")
+                print(f"Final MIA Accuracy: {summary.get('accuracy_final', 'N/A'):.4f}")
+                print(f"Final MIA F1 Score: {summary.get('f1_score_final', 'N/A'):.4f}")
+                print(f"Final TPR (Member Detection): {summary.get('tpr_final', 'N/A'):.4f}")
+                print(f"Final FPR (False Alarms): {summary.get('fpr_final', 'N/A'):.4f}")
+                print(f"\nMIA Accuracy - Mean: {summary.get('accuracy_mean', 'N/A'):.4f}, "
+                      f"Std: {summary.get('accuracy_std', 'N/A'):.4f}")
+                print(f"MIA F1 Score - Mean: {summary.get('f1_score_mean', 'N/A'):.4f}, "
+                      f"Std: {summary.get('f1_score_std', 'N/A'):.4f}")
+            print("============================================\n")
 
 
     def receive_models(self):

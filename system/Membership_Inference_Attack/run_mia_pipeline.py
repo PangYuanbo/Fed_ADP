@@ -7,15 +7,15 @@ if __name__ == "__main__":
     import torch
     import copy
     from model import FedAvgCNN, LocalModel
-    from whitebox_mia_pipeline import  whitebox_membership_inference_attack_pipeline, plot_attack_results_last_vs_avg
+    from whitebox_mia_pipeline import  whitebox_membership_inference_attack_pipeline, plot_attack_results_last_vs_fscore
     from train_attack_model import train_attack_model
     from evaluate_client_accuracy import evaluate_all_clients_accuracy
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     BATCH_SIZE = 1
-    EPOCHS = 100
+    EPOCHS = 50
     LR = 1e-3
     NUM_CLASSES = 10
-    NUM_CLIENTS = 11
+    NUM_CLIENTS = 10
     ALPHA = 1
     from model import GradientMIA
     # 构建目标模型结构（全复制）
@@ -27,7 +27,9 @@ if __name__ == "__main__":
 
     # 构造 shadow 模型文件名
     shadow_client_files = [
-        f"shadow_model/{ALPHA}/results_cifar-10-shadow_client{i}_1000_0.0050.pt"
+        # f"shadow_model/{ALPHA}/client_{i}_model_50_C1.0_tau0.1.pt"
+                f"shadow_model/{ALPHA}/results_cifar-10-shadow_client{i}_1000_0.0050.pt"
+        # f"shadow_model/{ALPHA}/results_client{i}_500.pt"
         for i in range(NUM_CLIENTS)
     ]
 
@@ -55,7 +57,8 @@ if __name__ == "__main__":
     target_model_names = [""]
     target_client_files = {
         name: [
-            f"dp_model/{ALPHA}/results_client{i}_1000{name}.pt"
+            f"dp_model/{ALPHA}/client_{i}_model_50_C1.0_tau0.1.pt"
+            # f"dp_model/{ALPHA}/results_client{i}_1000{name}.pt"
             # f"normal_model/{ALPHA}/results_cifar-10-normal_client{i}_1000_0.0050.pt"
             for i in range(NUM_CLIENTS)
         ] for name in target_model_names
@@ -81,7 +84,7 @@ if __name__ == "__main__":
     # 0) 预先给三维列表占位： part × client × label
     #    先建空 list，后面逐层 append
     all_results_by_part = [
-        [ [] for _ in range(NUM_CLIENTS) ]      # 每个 client 再存所有 label 的结果
+        [[] for _ in range(NUM_CLIENTS)]  # 每个 client 再存所有 label 的结果
         for _ in target_model_names
     ]
     # ---------------------------------------------
@@ -111,10 +114,9 @@ if __name__ == "__main__":
                 all_results_by_part[part_idx][c_idx].append(res)
 
     # all_results_by_part 结构：
-    # part_idx ─┬─ client_idx ─┬─ label_idx ─ dict{'attack_acc', 'TPS_acc', ...}
+    # part_idx ─┬─ client_idx ─┬─ label_idx ─ dict{'f_score', 'tpr', 'fpr', ...}
     #           │              └─ ...
     #           └─ ...
 
-
     # plot_attack_results_per_client(all_results_by_part, target_model_names)
-    plot_attack_results_last_vs_avg(all_results_by_part, target_model_names)
+    plot_attack_results_last_vs_fscore(all_results_by_part, target_model_names)

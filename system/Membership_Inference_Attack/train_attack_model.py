@@ -12,7 +12,7 @@ from data_utils import read_client_data, filter_by_label
 def train_attack_model(shadow_model, shadow_client_files, target_label, batch_size, device, epochs, lr, num_clients,alpha):
     attack_model = GradientMIA().to(device)
     optimizer = torch.optim.Adam(attack_model.parameters(), lr=lr)
-    loss_fn = torch.nn.BCELoss()
+    loss_fn = torch.nn.BCEWithLogitsLoss()
     print(len(shadow_client_files), len(shadow_client_files[0]))
 
     shadow_train_datasets = read_client_data(is_train=True, is_shadow=True,num_clients=num_clients,alpha=alpha)
@@ -99,7 +99,8 @@ def train_attack_model(shadow_model, shadow_client_files, target_label, batch_si
     print(f"[Training] Attack model for label {target_label}")
     for epoch in range(epochs):
         attack_model.train()
-        total_loss, correct = 0, 0
+        total_loss = 0
+        tp, fp, tn, fn = 0, 0, 0, 0  # For F-score calculation
         for g1, g2, g3, g4, softmax, labels in loader:
             g1, g2, g3, g4, softmax = g1.to(device), g2.to(device), g3.to(device), g4.to(device), softmax.to(device)
             labels = labels.float().unsqueeze(1).to(device)
@@ -109,8 +110,20 @@ def train_attack_model(shadow_model, shadow_client_files, target_label, batch_si
             loss.backward()
             optimizer.step()
             total_loss += loss.item() * labels.size(0)
-            correct += ((preds > 0.5).int() == labels.int()).sum().item()
-        acc = correct / len(loader.dataset)
-        print(f"[Epoch {epoch+1}/{epochs}] Loss: {total_loss/len(loader.dataset):.4f} Acc: {acc:.4f}")
+            
+            # Calculate confusion matrix elements for F-score
+            pred_binary = (preds > 0.5).float()
+            tp += ((pred_binary == 1) & (labels == 1)).sum().item()
+            fp += ((pred_binary == 1) & (labels == 0)).sum().item()
+            tn += ((pred_binary == 0) & (labels == 0)).sum().item()
+            fn += ((pred_binary == 0) & (labels == 1)).sum().item()
+        
+        # Calculate metrics
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f_score = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+        acc = (tp + tn) / (tp + fp + tn + fn) if (tp + fp + tn + fn) > 0 else 0.0
+        
+        print(f"[Epoch {epoch+1}/{epochs}] Loss: {total_loss/len(loader.dataset):.4f} F-score: {f_score:.4f} Acc: {acc:.4f}")
 
     torch.save(attack_model.state_dict(), f"attack_model{target_label}.pth")

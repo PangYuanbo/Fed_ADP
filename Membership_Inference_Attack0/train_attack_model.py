@@ -7,6 +7,7 @@ from torch.utils.data import DataLoader, TensorDataset, Subset
 from model import GradientMIA
 from mia_attack_utils import get_model_outputs_labels_and_grads, prepare_attack_model_inputs
 from data_utils import read_client_data, filter_by_label
+from sklearn.metrics import accuracy_score, f1_score
 
 
 def train_attack_model(shadow_model, shadow_client_files, target_label, batch_size, device, epochs, lr, num_clients):
@@ -88,6 +89,7 @@ def train_attack_model(shadow_model, shadow_client_files, target_label, batch_si
     for epoch in range(epochs):
         attack_model.train()
         total_loss, correct = 0, 0
+        all_preds, all_labels = [], []
         for g1, g2, g3, g4, softmax, labels in loader:
             g1, g2, g3, g4, softmax = g1.to(device), g2.to(device), g3.to(device), g4.to(device), softmax.to(device)
             labels = labels.float().unsqueeze(1).to(device)
@@ -98,8 +100,14 @@ def train_attack_model(shadow_model, shadow_client_files, target_label, batch_si
             optimizer.step()
             total_loss += loss.item() * labels.size(0)
             correct += ((preds > 0.5).int() == labels.int()).sum().item()
+            
+            # 收集预测结果和真实标签用于计算F-score
+            all_preds.extend(((preds > 0.5).int().cpu().numpy().flatten()))
+            all_labels.extend(labels.int().cpu().numpy().flatten())
+        
         acc = correct / len(loader.dataset)
-        print(f"[Epoch {epoch+1}/{epochs}] Loss: {total_loss/len(loader.dataset):.4f} Acc: {acc:.4f}")
+        f1 = f1_score(all_labels, all_preds, average='binary')
+        print(f"[Epoch {epoch+1}/{epochs}] Loss: {total_loss/len(loader.dataset):.4f} Acc: {acc:.4f} F1-Score: {f1:.4f}")
 
     torch.save(attack_model.state_dict(), f"attack_model{target_label}.pth")
     print(f"[INFO] Attack model for label {target_label} saved.")
