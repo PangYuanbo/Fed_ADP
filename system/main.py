@@ -12,6 +12,16 @@ from flcore.trainmodel.models import *
 
 from utils.mem_utils import MemReporter
 
+# RL-DP imports (optional, only loaded when needed)
+try:
+    from flcore.servers.servercp_rl import FedCP_RL
+    from utils.rl_config import get_rl_dp_config
+    RL_AVAILABLE = True
+    print("[Main] RL-DP system available")
+except ImportError as e:
+    RL_AVAILABLE = False
+    print(f"[Main] RL-DP system not available: {e}")
+
 warnings.simplefilter("ignore")
 torch.manual_seed(0)
 
@@ -56,22 +66,27 @@ def run(args):
             args.head = copy.deepcopy(args.model.fc)
             args.model.fc = nn.Identity()
             args.model = LocalModel(args.model, args.head)
-            
-            # 选择服务器类型：标准FedCP、RL-DP或精细化RL-DP
-            if getattr(args, 'enable_rl_dp', False) and getattr(args, 'enable_fine_rl', False):
-                from flcore.servers.servercp_fine_rl import FedCPFineRL
-                server = FedCPFineRL(args, i)
-                print(f"[Main] Using FedCP with Fine-grained RL-DP")
-                print(f"  Granularity: {args.fine_granularity}")
-                print(f"  Privacy budget: {args.privacy_budget}")
-                print(f"  Block size: {args.block_size}")
-            elif getattr(args, 'enable_rl_dp', False):
-                from flcore.servers.servercp_rl import FedCPRL
-                server = FedCPRL(args, i)
-                print(f"[Main] Using FedCP with standard RL-DP (privacy_budget={args.privacy_budget})")
+
+            # 检查是否启用RL-DP系统
+            use_rl = getattr(args, 'enable_rl_dp', False) and args.difference_privacy and RL_AVAILABLE
+
+            if use_rl:
+                # 配置RL参数
+                rl_config = get_rl_dp_config()
+                rl_config.update_from_args(args)
+
+                server = FedCP_RL(args, i)
+                print(f"[Main] Using RL-enhanced FedCP (RL starts from round {getattr(args, 'rl_min_rounds', 100)})")
+
+                # 打印RL配置摘要
+                print(f"[Main] RL Config: lr={rl_config.rl_learning_rate}, epsilon={rl_config.rl_epsilon}")
+                print(f"[Main] Action space: {len(rl_config.action_space)} discrete actions")
             else:
                 server = FedCP(args, i)
-                print("[Main] Using standard FedCP")
+                if not args.difference_privacy:
+                    print("[Main] Using standard FedCP (no DP)")
+                else:
+                    print("[Main] Using standard FedCP with fixed DP thresholds")
         else:
             raise NotImplementedError
             
@@ -124,57 +139,38 @@ if __name__ == "__main__":
     parser.add_argument('-lam', "--lamda", type=float, default=0.0)
     parser.add_argument('-mia', "--enable_mia", type=bool, default=False,
                         help="Enable MIA evaluation during training")
-    
-    # RL-DP (Reinforcement Learning Differential Privacy) 参数
-    parser.add_argument('-rl_dp', "--enable_rl_dp", type=bool, default=False,
-                        help="Enable reinforcement learning-based differential privacy")
-    parser.add_argument('-pb', "--privacy_budget", type=float, default=10.0,
-                        help="Total privacy budget for RL-DP")
-    parser.add_argument('-rl_lr', type=float, default=3e-4,
+
+    # RL-DP parameters (only used if RL is available and enabled)
+    parser.add_argument('--enable_rl_dp', type=bool, default=False,
+                        help="Enable RL-based adaptive differential privacy (requires DP enabled)")
+    parser.add_argument('--rl_min_rounds', type=int, default=100,
+                        help="Minimum rounds before enabling RL (default: 100)")
+    parser.add_argument('--rl_learning_rate', type=float, default=0.01,
                         help="Learning rate for RL agent")
-    parser.add_argument('-rl_train_interval', type=int, default=10,
-                        help="RL agent training interval (rounds)")
-    parser.add_argument('-rl_model_path', type=str, default="rl_models/rl_dp_agent.pth",
-                        help="Path to save/load RL model")
-    
-    # Fine-grained RL-DP 精细化控制参数
-    parser.add_argument('-fine_rl', "--enable_fine_rl", type=bool, default=False,
-                        help="Enable fine-grained weight-level RL-DP control")
-    parser.add_argument('-granularity', "--fine_granularity", type=str, default="block",
-                        choices=['layer', 'block', 'weight'],
-                        help="Granularity level: layer, block, or weight")
-    parser.add_argument('-block_size', type=str, default="8,8",
-                        help="Block size for block-level control (format: 'h,w')")
-    parser.add_argument('-importance_method', type=str, default="combined",
-                        choices=['gradient', 'fisher', 'activation', 'weight_magnitude', 'combined'],
-                        help="Weight importance evaluation method")
-    parser.add_argument('-visualize_noise', type=bool, default=False,
-                        help="Enable noise pattern visualization")
+    parser.add_argument('--rl_epsilon', type=float, default=0.1,
+                        help="Initial exploration rate for RL agent")
+    parser.add_argument('--rl_update_interval', type=int, default=10,
+                        help="Interval for RL policy updates (in rounds)")
 
     args = parser.parse_args()
     
-    # 处理block_size参数
-    if hasattr(args, 'block_size') and isinstance(args.block_size, str):
-        try:
-            args.block_size = tuple(map(int, args.block_size.split(',')))
-        except:
-            args.block_size = (8, 8)  # 默认值
     
     print("dp", args.difference_privacy)
     print("MIA evaluation enabled:", args.enable_mia)
-    print("RL-DP enabled:", getattr(args, 'enable_rl_dp', False))
-    print("Fine-grained RL enabled:", getattr(args, 'enable_fine_rl', False))
-    
+
+    # 打印RL-DP状态
     if getattr(args, 'enable_rl_dp', False):
-        print(f"Privacy budget: {args.privacy_budget}")
-        print(f"RL learning rate: {args.rl_lr}")
-        print(f"RL training interval: {args.rl_train_interval}")
-        
-        if getattr(args, 'enable_fine_rl', False):
-            print(f"Fine-grained granularity: {args.fine_granularity}")
-            print(f"Block size: {args.block_size}")
-            print(f"Importance method: {args.importance_method}")
-            print(f"Noise visualization: {args.visualize_noise}")
+        if not RL_AVAILABLE:
+            print("WARNING: RL-DP requested but not available. Using standard DP.")
+        elif not args.difference_privacy:
+            print("WARNING: RL-DP requires differential privacy to be enabled.")
+        else:
+            print("RL-DP system enabled!")
+            print(f"RL will start from round {args.rl_min_rounds}")
+            print(f"RL learning rate: {args.rl_learning_rate}")
+            print(f"RL exploration rate: {args.rl_epsilon}")
+    else:
+        print("RL-DP system disabled (using standard approach)")
     
     os.environ["CUDA_VISIBLE_DEVICES"] = args.device_id
     print("dp_number",args.difference_privacy_number)
