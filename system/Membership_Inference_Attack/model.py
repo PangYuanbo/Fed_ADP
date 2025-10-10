@@ -299,7 +299,7 @@ class GradientMIA(nn.Module):
 
         self.classifier = nn.Sequential(
             nn.Linear(320, 64), nn.ReLU(), nn.Dropout(0.5),
-            nn.Linear(64, 1), nn.Sigmoid()
+            nn.Linear(64, 1)  # 移除Sigmoid，因为BCEWithLogitsLoss内部已包含
         )
 
     def forward(self, grad_conv1, grad_conv2, grad_fc1, grad_fc, softmax_out):

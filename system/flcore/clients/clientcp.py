@@ -207,6 +207,28 @@ class clientCP:
         for idx, it in enumerate(items):
             self.save_item(it, 'item_' + str(idx) + '_' + tag, item_path)
 
+    def train_metrics(self):
+        """计算训练集上的准确率"""
+        trainloader = self.load_train_data()
+        self.model.eval()
+
+        train_acc = 0
+        train_num = 0
+
+        with torch.no_grad():
+            for x, y in trainloader:
+                if type(x) == type([]):
+                    x[0] = x[0].to(self.device)
+                else:
+                    x = x.to(self.device)
+                y = y.to(self.device)
+                output = self.model(x)
+
+                train_acc += (torch.sum(torch.argmax(output, dim=1) == y)).item()
+                train_num += y.shape[0]
+
+        return train_acc, train_num
+
     def test_metrics_before(self):
         testloader = self.load_test_data()
         self.model.eval()

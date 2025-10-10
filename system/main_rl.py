@@ -147,6 +147,20 @@ if __name__ == "__main__":
                         choices=['conservative', 'aggressive', 'balanced', 'privacy_focused', 'accuracy_focused'],
                         help="Use a preset configuration for RL-DP system")
 
+    # 添加连续RL参数
+    parser.add_argument('--use_continuous_rl', type=int, default=0,
+                        help="Use continuous action space RL (DDPG) instead of discrete (DQN) (0=False, 1=True)")
+    parser.add_argument('--rl_actor_lr', type=float, default=0.0001,
+                        help="Learning rate for continuous RL actor network")
+    parser.add_argument('--rl_critic_lr', type=float, default=0.001,
+                        help="Learning rate for continuous RL critic network")
+    parser.add_argument('--rl_gamma', type=float, default=0.95,
+                        help="Discount factor for continuous RL")
+    parser.add_argument('--rl_tau', type=float, default=0.005,
+                        help="Soft update coefficient for continuous RL target networks")
+    parser.add_argument('--rl_noise_scale', type=float, default=0.1,
+                        help="Exploration noise scale for continuous RL")
+
     args = parser.parse_args()
 
     # 应用预设配置（如果指定）

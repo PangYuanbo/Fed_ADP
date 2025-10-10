@@ -27,7 +27,8 @@ class SimpleRLAgent:
                  epsilon_min: float = 0.05,
                  discount_factor: float = 0.95,
                  memory_size: int = 1000,
-                 device: str = "auto"):
+                 device: str = "auto",
+                 verbose: bool = False):
         """
         初始化简化RL智能体
 
@@ -40,7 +41,9 @@ class SimpleRLAgent:
             discount_factor: 折扣因子
             memory_size: 经验回放缓存大小
             device: 计算设备
+            verbose: 是否打印详细日志
         """
+        self.verbose = verbose
         self.state_dim = state_dim
         self.action_dim = 5  # 5个离散动作
         self.lr = learning_rate
@@ -79,9 +82,10 @@ class SimpleRLAgent:
         # 初始化目标网络
         self.update_target_network()
 
-        print(f"[SimpleRL] Initialized RL agent with {self.action_dim} actions")
-        print(f"[SimpleRL] Action space: {self.action_space}")
-        print(f"[SimpleRL] Device: {self.device}")
+        if self.verbose:
+            print(f"[SimpleRL] Initialized RL agent with {self.action_dim} actions")
+            print(f"[SimpleRL] Action space: {self.action_space}")
+            print(f"[SimpleRL] Device: {self.device}")
 
     def _build_network(self) -> nn.Module:
         """构建简单的Q网络"""
@@ -245,7 +249,8 @@ class SimpleRLAgent:
             'action_space': self.action_space
         }
         torch.save(checkpoint, filepath)
-        print(f"[SimpleRL] Model saved to {filepath}")
+        if self.verbose:
+            print(f"[SimpleRL] Model saved to {filepath}")
 
     def load_model(self, filepath: str):
         """加载模型"""
@@ -257,10 +262,12 @@ class SimpleRLAgent:
             self.epsilon = checkpoint.get('epsilon', self.epsilon)
             self.training_history = checkpoint.get('training_history', [])
             self.action_counts = checkpoint.get('action_counts', {i: 0 for i in range(self.action_dim)})
-            print(f"[SimpleRL] Model loaded from {filepath}")
+            if self.verbose:
+                print(f"[SimpleRL] Model loaded from {filepath}")
             return True
         else:
-            print(f"[SimpleRL] Model file not found: {filepath}")
+            if self.verbose:
+                print(f"[SimpleRL] Model file not found: {filepath}")
             return False
 
     def get_statistics(self) -> Dict:
@@ -301,7 +308,8 @@ class RLDPManager:
     def __init__(self,
                  agent: SimpleRLAgent,
                  update_interval: int = 10,
-                 min_rounds_before_rl: int = 20):
+                 min_rounds_before_rl: int = 20,
+                 verbose: bool = False):
         """
         初始化RL-DP管理器
 
@@ -309,7 +317,9 @@ class RLDPManager:
             agent: RL智能体
             update_interval: RL策略更新间隔轮次
             min_rounds_before_rl: 启用RL前的最小轮次数
+            verbose: 是否打印详细日志
         """
+        self.verbose = verbose
         self.agent = agent
         self.update_interval = update_interval
         self.min_rounds_before_rl = min_rounds_before_rl
@@ -330,8 +340,9 @@ class RLDPManager:
         self.last_accuracy = None
         self.last_mia_f_score = None
 
-        print(f"[RLDP Manager] Initialized with update interval: {update_interval}")
-        print(f"[RLDP Manager] RL will be enabled after round {min_rounds_before_rl}")
+        if self.verbose:
+            print(f"[RLDP Manager] Initialized with update interval: {update_interval}")
+            print(f"[RLDP Manager] RL will be enabled after round {min_rounds_before_rl}")
 
     def should_use_rl(self, round_num: int) -> bool:
         """判断是否应该使用RL策略"""
@@ -376,7 +387,7 @@ class RLDPManager:
             # 训练
             if round_num % self.update_interval == 0:
                 loss = self.agent.train_step()
-                if loss is not None:
+                if loss is not None and self.verbose:
                     print(f"[RLDP] Round {round_num}: RL training loss = {loss:.4f}")
 
                 # 定期更新目标网络
@@ -399,7 +410,7 @@ class RLDPManager:
         self.history['actions'].append(self.current_action)
         self.history['thresholds'].append(thresholds)
 
-        if round_num % 20 == 0:  # 每20轮打印一次
+        if self.verbose and round_num % 20 == 0:  # 每20轮打印一次
             print(f"[RLDP] Round {round_num}: Action {self.current_action}, Thresholds {thresholds}, Acc {accuracy:.4f}, MIA {mia_f_score:.4f}")
 
         return thresholds
@@ -421,10 +432,14 @@ class RLDPManager:
         with open(filepath, 'w') as f:
             json.dump(checkpoint, f, indent=2, default=str)
 
-        print(f"[RLDP] Checkpoint saved to {filepath}")
+        if self.verbose:
+            print(f"[RLDP] Checkpoint saved to {filepath}")
 
-    def load_checkpoint(self, filepath: str):
+    def load_checkpoint(self, filepath: str, verbose: bool = None):
         """加载检查点"""
+        if verbose is None:
+            verbose = self.verbose
+
         if os.path.exists(filepath):
             with open(filepath, 'r') as f:
                 checkpoint = json.load(f)
@@ -438,10 +453,12 @@ class RLDPManager:
             agent_path = filepath.replace('.json', '_agent.pth')
             self.agent.load_model(agent_path)
 
-            print(f"[RLDP] Checkpoint loaded from {filepath}")
+            if verbose:
+                print(f"[RLDP] Checkpoint loaded from {filepath}")
             return True
         else:
-            print(f"[RLDP] Checkpoint file not found: {filepath}")
+            if verbose:
+                print(f"[RLDP] Checkpoint file not found: {filepath}")
             return False
 
     def get_summary(self) -> Dict:

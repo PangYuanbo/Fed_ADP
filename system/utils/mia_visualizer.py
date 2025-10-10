@@ -193,7 +193,7 @@ class MIAVisualizer:
         ax.grid(True, alpha=0.3)
 
     def _plot_individual_client_trends(self, ax, rounds, client_f_scores):
-        """绘制各客户端F-score趋势"""
+        """绘制各客户端F-score趋势（最多显示10个代表性客户端）"""
         if not client_f_scores:
             ax.text(0.5, 0.5, 'No Client Data Available',
                    ha='center', va='center', transform=ax.transAxes,
@@ -201,7 +201,7 @@ class MIAVisualizer:
             return
 
         # 选择要显示的客户端（最多显示10个）
-        client_ids = sorted(list(client_f_scores.keys()))
+        client_ids = sorted(list(client_f_scores.keys()), key=lambda x: int(x) if str(x).isdigit() else x)
         if len(client_ids) > 10:
             step = len(client_ids) // 10
             selected_clients = client_ids[::step][:10]
@@ -220,9 +220,9 @@ class MIAVisualizer:
 
         ax.set_xlabel('Training Round', fontsize=12, fontweight='bold')
         ax.set_ylabel('F-score', fontsize=12, fontweight='bold')
-        ax.set_title('Individual Client F-score Trends', fontsize=14, fontweight='bold')
+        ax.set_title('Individual Client F-score Trends (Sample)', fontsize=14, fontweight='bold')
         ax.grid(True, alpha=0.3)
-        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=9)
         ax.set_ylim(0, 1)
 
     def _plot_f_score_distribution(self, ax, rounds, client_f_scores):
@@ -329,5 +329,135 @@ class MIAVisualizer:
 
         with open(save_path, 'w', encoding='utf-8') as f:
             f.write('\n'.join(report))
+
+        return save_path
+
+    def plot_per_client_f_scores(self,
+                                  mia_results_history: List[Dict],
+                                  save_dir: str = "mia_visualizations",
+                                  dataset_name: str = "dataset",
+                                  alpha: float = 1.0) -> str:
+        """
+        绘制每个客户端的详细F-score走势图（显示所有客户端）
+
+        Args:
+            mia_results_history: MIA结果历史数据
+            save_dir: 保存目录
+            dataset_name: 数据集名称
+            alpha: 数据分布参数
+
+        Returns:
+            str: 保存的图片路径
+        """
+        if not mia_results_history:
+            raise ValueError("No MIA results history provided")
+
+        # 创建保存目录
+        os.makedirs(save_dir, exist_ok=True)
+
+        # 提取数据
+        rounds = []
+        client_f_scores = {}  # client_id -> [f_scores]
+
+        for result in mia_results_history:
+            if result['status'] == 'success' and 'summary' in result:
+                round_num = result['round']
+                rounds.append(round_num)
+
+                # 收集各客户端数据
+                for client_id, client_result in result['clients'].items():
+                    if client_result['status'] == 'success':
+                        if client_id not in client_f_scores:
+                            client_f_scores[client_id] = []
+                        client_f_scores[client_id].append(
+                            client_result['summary']['avg_f_score']
+                        )
+
+        if not client_f_scores:
+            raise ValueError("No client F-score data found")
+
+        # 排序客户端ID
+        client_ids = sorted(list(client_f_scores.keys()), key=lambda x: int(x) if str(x).isdigit() else x)
+        num_clients = len(client_ids)
+
+        # 创建图表（根据客户端数量动态调整）
+        # 每行最多显示5个客户端
+        ncols = min(5, num_clients)
+        nrows = (num_clients + ncols - 1) // ncols
+
+        fig, axes = plt.subplots(nrows, ncols, figsize=(4*ncols, 3*nrows))
+
+        # 确保axes是二维数组
+        if nrows == 1 and ncols == 1:
+            axes = np.array([[axes]])
+        elif nrows == 1:
+            axes = axes.reshape(1, -1)
+        elif ncols == 1:
+            axes = axes.reshape(-1, 1)
+
+        # 为每个客户端绘制独立的子图
+        for idx, client_id in enumerate(client_ids):
+            row = idx // ncols
+            col = idx % ncols
+            ax = axes[row, col]
+
+            f_scores = client_f_scores[client_id]
+            client_rounds = rounds[:len(f_scores)]
+
+            # 绘制F-score曲线
+            ax.plot(client_rounds, f_scores,
+                   marker='o', linewidth=2, markersize=5,
+                   color=self.colors['primary'], markerfacecolor='white',
+                   markeredgewidth=1.5, markeredgecolor=self.colors['primary'])
+
+            # 添加风险级别参考线
+            ax.axhline(y=0.8, color=self.risk_colors['high'], linestyle='--', alpha=0.5, linewidth=1)
+            ax.axhline(y=0.6, color=self.risk_colors['medium'], linestyle='--', alpha=0.5, linewidth=1)
+
+            # 填充风险区域
+            ax.fill_between(client_rounds, 0.8, 1.0, alpha=0.1, color=self.risk_colors['high'])
+            ax.fill_between(client_rounds, 0.6, 0.8, alpha=0.1, color=self.risk_colors['medium'])
+            ax.fill_between(client_rounds, 0.0, 0.6, alpha=0.1, color=self.risk_colors['low'])
+
+            ax.set_xlabel('Round', fontsize=10)
+            ax.set_ylabel('F-score', fontsize=10)
+            ax.set_title(f'Client {client_id}', fontsize=11, fontweight='bold')
+            ax.grid(True, alpha=0.3)
+            ax.set_ylim(0, 1)
+
+            # 在最后一个点添加数值标注
+            if f_scores:
+                final_score = f_scores[-1]
+                final_round = client_rounds[-1]
+                ax.annotate(f'{final_score:.3f}',
+                          (final_round, final_score),
+                          textcoords="offset points",
+                          xytext=(5, 5),
+                          ha='left',
+                          fontsize=8,
+                          alpha=0.8)
+
+        # 隐藏多余的子图
+        for idx in range(num_clients, nrows * ncols):
+            row = idx // ncols
+            col = idx % ncols
+            axes[row, col].axis('off')
+
+        # 设置总标题
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        fig.suptitle(f'Per-Client MIA F-score Analysis - {dataset_name} (α={alpha})\n'
+                    f'Total Clients: {num_clients} | Generated at {timestamp}',
+                    fontsize=14, fontweight='bold')
+
+        # 调整布局
+        plt.tight_layout()
+
+        # 保存图片
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"mia_per_client_{dataset_name}_alpha{alpha}_{timestamp_str}.png"
+        save_path = os.path.join(save_dir, filename)
+
+        plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
+        plt.close()
 
         return save_path

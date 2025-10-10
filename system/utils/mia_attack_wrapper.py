@@ -22,7 +22,13 @@ MIA_AVAILABLE = False
 
 try:
     from model import FedAvgCNN, LocalModel, GradientMIA
-    from mia_attack_utils import get_model_outputs_labels_and_grads, prepare_attack_model_inputs
+    from mia_attack_utils import (
+        get_model_outputs_labels_and_grads,
+        prepare_attack_model_inputs,
+        get_model_outputs_labels_and_grads_gpu,     # GPU优化版本（生成器）
+        prepare_attack_model_inputs_gpu,             # GPU优化版本（批量）
+        prepare_attack_model_inputs_single_gpu       # GPU优化版本（单batch流式）
+    )
     from data_utils import read_client_data, filter_by_label
     MIA_AVAILABLE = True
     print(f"[MIA Wrapper] Successfully imported MIA modules from: {mia_path}")
@@ -36,6 +42,9 @@ except ImportError as e:
     class GradientMIA: pass
     def get_model_outputs_labels_and_grads(*args, **kwargs): pass
     def prepare_attack_model_inputs(*args, **kwargs): pass
+    def get_model_outputs_labels_and_grads_gpu(*args, **kwargs): pass
+    def prepare_attack_model_inputs_gpu(*args, **kwargs): pass
+    def prepare_attack_model_inputs_single_gpu(*args, **kwargs): pass
     def read_client_data(*args, **kwargs): pass
     def filter_by_label(*args, **kwargs): pass
 
@@ -51,7 +60,9 @@ class FederatedMIAEvaluator:
                  device: str = "auto",
                  batch_size: int = 1,
                  alpha: float = 1.0,
-                 max_samples_per_client: int = 50):
+                 max_samples_per_client: int = None,
+                 use_global_test: bool = True,
+                 use_gpu_optimization: bool = True):  # 🔑 新增GPU优化选项
         """
         初始化联邦学习MIA评估器
 
@@ -61,7 +72,9 @@ class FederatedMIAEvaluator:
             device: 计算设备
             batch_size: 批次大小
             alpha: 数据分布参数
-            max_samples_per_client: 每个客户端最大样本数（用于加速）
+            max_samples_per_client: 每个客户端最大样本数（None表示使用全部数据）
+            use_global_test: 是否使用全局test数据集作为non-member（默认True）
+            use_gpu_optimization: 是否使用GPU优化模式（数据保持在GPU上，适合5090等大显存GPU）
         """
         # 检查MIA模块是否可用
         if not MIA_AVAILABLE:
@@ -73,10 +86,21 @@ class FederatedMIAEvaluator:
         self.batch_size = batch_size
         self.alpha = alpha
         self.max_samples_per_client = max_samples_per_client
+        self.use_global_test = use_global_test
+        self.use_gpu_optimization = use_gpu_optimization and self.device.type == 'cuda'  # 只在CUDA设备上启用
 
         print(f"[MIA Wrapper] Initializing with attack_model_dir: {attack_model_dir}")
         print(f"[MIA Wrapper] Device: {self.device}")
         print(f"[MIA Wrapper] Num classes: {num_classes}")
+        print(f"[MIA Wrapper] Use global test data: {use_global_test}")
+        print(f"[MIA Wrapper] GPU Optimization: {self.use_gpu_optimization}")  # 显示GPU优化状态
+
+        # 🔑 强制GPU优化警告
+        if not self.use_gpu_optimization:
+            print("[MIA Wrapper] WARNING: GPU optimization is disabled. This will significantly slow down MIA evaluation!")
+            print("[MIA Wrapper] Make sure you are using a CUDA device for best performance.")
+        else:
+            print("[MIA Wrapper] ✓ GPU optimization enabled - all MIA computations will run on GPU")
 
         # 加载攻击模型
         self.attack_models = {}
@@ -116,27 +140,77 @@ class FederatedMIAEvaluator:
         base.fc = torch.nn.Identity()
         return LocalModel(base, head)
 
+    def _create_global_test_loader(self, clients):
+        """
+        创建全局test数据加载器（合并所有clients的test数据）
+
+        Args:
+            clients: 客户端列表
+
+        Returns:
+            DataLoader: 包含所有clients test数据的DataLoader
+        """
+        print(f"[MIA Wrapper] Creating global test dataset from {len(clients)} clients...")
+
+        all_test_samples_x = []
+        all_test_samples_y = []
+
+        for client in clients:
+            try:
+                # 获取该client的test数据
+                test_loader = client.load_test_data(batch_size=self.batch_size)
+
+                # 收集所有test数据
+                for batch_x, batch_y in test_loader:
+                    all_test_samples_x.append(batch_x.cpu())
+                    all_test_samples_y.append(batch_y.cpu())
+
+            except Exception as e:
+                print(f"[MIA Wrapper] Warning: Failed to load test data for client {client.id}: {e}")
+                continue
+
+        if not all_test_samples_x:
+            print(f"[MIA Wrapper] Warning: No test data collected from clients")
+            return None
+
+        # 合并所有数据
+        global_test_x = torch.cat(all_test_samples_x, dim=0)
+        global_test_y = torch.cat(all_test_samples_y, dim=0)
+
+        print(f"[MIA Wrapper] Global test dataset created: {len(global_test_x)} total samples")
+
+        # 创建TensorDataset和DataLoader
+        from torch.utils.data import TensorDataset
+        global_test_dataset = TensorDataset(global_test_x, global_test_y)
+        global_test_loader = DataLoader(global_test_dataset, batch_size=self.batch_size, shuffle=False)
+
+        return global_test_loader
+
     def evaluate_client_mia(self,
-                           client_model,
-                           client_id: int,
-                           dataset_name: str,
-                           target_labels: Optional[List[int]] = None) -> Dict:
+                           client,
+                           target_labels: Optional[List[int]] = None,
+                           global_test_loader: Optional[DataLoader] = None) -> Dict:
         """
         评估单个客户端的MIA攻击成功率
 
         Args:
-            client_model: 客户端模型
-            client_id: 客户端ID
-            dataset_name: 数据集名称
+            client: 客户端对象，必须有以下属性/方法：
+                - client.id: 客户端ID
+                - client.model: 客户端模型
+                - client.load_train_data(): 返回训练数据DataLoader
+                - client.load_test_data(): 返回测试数据DataLoader（仅在global_test_loader=None时使用）
             target_labels: 目标标签列表，None表示所有标签
+            global_test_loader: 全局test数据加载器（所有clients的test data合并），
+                               如果提供则使用全局test data作为non-member，
+                               否则使用client自己的test data
 
         Returns:
             Dict: MIA评估结果
         """
         if not self.attack_models:
-            print(f"[MIA Wrapper] Client {client_id}: No attack models available")
+            print(f"[MIA Wrapper] Client {client.id}: No attack models available")
             return {
-                'client_id': client_id,
+                'client_id': client.id,
                 'status': 'failed',
                 'error': 'No attack models available'
             }
@@ -148,125 +222,183 @@ class FederatedMIAEvaluator:
             target_labels = [label for label in target_labels if label in self.attack_models]
 
         if not target_labels:
-            print(f"[MIA Wrapper] Client {client_id}: No valid target labels")
+            print(f"[MIA Wrapper] Client {client.id}: No valid target labels")
             return {
-                'client_id': client_id,
+                'client_id': client.id,
                 'status': 'failed',
                 'error': 'No valid target labels'
             }
 
         try:
-            # 加载客户端数据 - 使用MIA模块的数据加载方式
-            print(f"[MIA Wrapper] Client {client_id}: Loading data for dataset {dataset_name}, alpha={self.alpha}")
+            # 🔑 关键修复: 评估前清理模型梯度和缓存
+            if hasattr(client, 'model') and client.model is not None:
+                client.model.eval()  # 确保评估模式
+                client.model.zero_grad()  # 清理梯度
+                # 清理所有参数的梯度
+                for param in client.model.parameters():
+                    if param.grad is not None:
+                        param.grad = None
 
-            # 数据集名称映射 - 将联邦学习的数据集名称映射到MIA的名称
-            dataset_mapping = {
-                'cifar10': 'cifar-10-normal',
-                'cifar-10': 'cifar-10-normal',
-                'cifar-10-normal': 'cifar-10-normal'
-            }
+            # 获取train data loader
+            train_loader = client.load_train_data(batch_size=self.batch_size)
 
-            # 确保我们使用正确的数据集名称
-            mapped_dataset = dataset_mapping.get(dataset_name, 'cifar-10-normal')
-            print(f"[MIA Wrapper] Mapped dataset '{dataset_name}' to '{mapped_dataset}'")
+            # 根据是否提供global_test_loader决定使用哪个test data
+            if global_test_loader is not None:
+                print(f"[MIA Wrapper] Client {client.id}: Using GLOBAL test data as non-member")
+                test_loader = global_test_loader
+            else:
+                print(f"[MIA Wrapper] Client {client.id}: Using client's own test data as non-member")
+                test_loader = client.load_test_data(batch_size=self.batch_size)
 
-            # 使用自定义数据加载函数，指向新的数据路径
-            project_root = os.path.join(os.path.dirname(__file__), '..', '..')
-            project_root = os.path.abspath(project_root)
-            dataset_base_path = os.path.join(project_root, 'dataset')
-
-            print(f"[MIA Wrapper] Using dataset path: {dataset_base_path}")
-
-            # MIA模块的read_client_data返回所有客户端的数据列表，我们需要选择特定的客户端
-            is_shadow = False  # 使用正常模型数据，不是影子模型数据
-            num_clients = 10   # 假设有10个客户端
-
-            # 使用自定义数据加载函数
-            train_data_list = self._read_client_data_custom(
-                dataset_base_path, is_train=True, is_shadow=is_shadow,
-                num_clients=num_clients, alpha=self.alpha
-            )
-            test_data_list = self._read_client_data_custom(
-                dataset_base_path, is_train=False, is_shadow=is_shadow,
-                num_clients=num_clients, alpha=self.alpha
-            )
-
-            # 获取特定客户端的数据
-            if client_id >= len(train_data_list) or client_id >= len(test_data_list):
-                raise IndexError(f"Client {client_id} not found in data (available: {len(train_data_list)} clients)")
-
-            train_data = train_data_list[client_id]
-            test_data = test_data_list[client_id]
-
-            print(f"[MIA Wrapper] Client {client_id}: Train data size: {len(train_data)}, Test data size: {len(test_data)}")
+            print(f"[MIA Wrapper] Client {client.id}: Data loaders created successfully")
 
             client_results = {
-                'client_id': client_id,
+                'client_id': client.id,
                 'status': 'success',
-                'label_results': {},
                 'summary': {}
             }
 
-            all_f_scores = []
-            all_tprs = []
-            all_fprs = []
-            all_accuracies = []
+            # 🔑 优化：使用滚动统计，避免保存所有label的结果
+            label_stats = {
+                'sum_f_score': 0.0, 'sum_f_score_sq': 0.0,
+                'sum_tpr': 0.0, 'sum_fpr': 0.0, 'sum_accuracy': 0.0,
+                'max_f_score': -float('inf'), 'min_f_score': float('inf'),
+                'labels_evaluated': 0
+            }
 
-            for label in target_labels:
-                label_result = self._evaluate_single_label(
-                    client_model, train_data, test_data, label
+            for idx, label in enumerate(target_labels):
+                label_result = self._evaluate_single_label_with_loaders(
+                    client.model, train_loader, test_loader, label
                 )
 
                 if label_result['status'] == 'success':
-                    client_results['label_results'][label] = label_result
-                    all_f_scores.append(label_result['f_score'])
-                    all_tprs.append(label_result['tpr'])
-                    all_fprs.append(label_result['fpr'])
-                    all_accuracies.append(label_result['accuracy'])
+                    # 🔑 只提取关键指标，不保存完整结果
+                    f_score = label_result['f_score']
+                    label_stats['sum_f_score'] += f_score
+                    label_stats['sum_f_score_sq'] += f_score ** 2
+                    label_stats['sum_tpr'] += label_result['tpr']
+                    label_stats['sum_fpr'] += label_result['fpr']
+                    label_stats['sum_accuracy'] += label_result['accuracy']
+                    label_stats['max_f_score'] = max(label_stats['max_f_score'], f_score)
+                    label_stats['min_f_score'] = min(label_stats['min_f_score'], f_score)
+                    label_stats['labels_evaluated'] += 1
 
-            # 计算总体统计
-            if all_f_scores:
+                    print(f"[MIA Wrapper]   Label {label} F-score: {f_score:.4f}")
+
+                # 🔑 立即删除label结果，强制清理
+                del label_result
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            # 🔑 从滚动统计计算总体统计
+            if label_stats['labels_evaluated'] > 0:
+                n = label_stats['labels_evaluated']
+                avg_f_score = label_stats['sum_f_score'] / n
+                variance = (label_stats['sum_f_score_sq'] / n) - (avg_f_score ** 2)
+
                 client_results['summary'] = {
-                    'avg_f_score': np.mean(all_f_scores),
-                    'avg_tpr': np.mean(all_tprs),
-                    'avg_fpr': np.mean(all_fprs),
-                    'avg_accuracy': np.mean(all_accuracies),
-                    'max_f_score': np.max(all_f_scores),
-                    'min_f_score': np.min(all_f_scores),
-                    'labels_evaluated': len(all_f_scores),
-                    'privacy_risk': self._assess_privacy_risk(np.mean(all_f_scores))
+                    'avg_f_score': avg_f_score,
+                    'avg_tpr': label_stats['sum_tpr'] / n,
+                    'avg_fpr': label_stats['sum_fpr'] / n,
+                    'avg_accuracy': label_stats['sum_accuracy'] / n,
+                    'max_f_score': label_stats['max_f_score'],
+                    'min_f_score': label_stats['min_f_score'],
+                    'labels_evaluated': n,
+                    'privacy_risk': self._assess_privacy_risk(avg_f_score)
                 }
             else:
                 client_results['status'] = 'failed'
                 client_results['error'] = 'No successful label evaluations'
 
+            # **关键修复**: 清理DataLoader和统计器
+            del train_loader, test_loader
+            del label_stats
+
+            # 强制垃圾回收
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
             return client_results
 
         except Exception as e:
-            print(f"[MIA Wrapper] Client {client_id}: Exception during evaluation: {str(e)}")
+            print(f"[MIA Wrapper] Client {client.id}: Exception during evaluation: {str(e)}")
             import traceback
             traceback.print_exc()
+
+            # 清理内存
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
             return {
-                'client_id': client_id,
+                'client_id': client.id,
                 'status': 'failed',
                 'error': f"Exception during evaluation: {str(e)}"
             }
 
-    def _evaluate_single_label(self, client_model, train_data, test_data, target_label) -> Dict:
-        """评估单个标签的MIA攻击"""
+    def _evaluate_single_label_with_loaders(self, client_model, train_loader, test_loader, target_label) -> Dict:
+        """
+        使用DataLoader评估单个标签的MIA攻击（使用完整数据集，强制内存回收）
+        """
         try:
-            # 过滤特定标签的数据
-            train_filtered = filter_by_label(train_data, target_label)
-            test_filtered = filter_by_label(test_data, target_label)
+            # 🔑 关键修复: 评估前清理模型状态
+            client_model.eval()
+            client_model.zero_grad()
+            # 从DataLoader中过滤特定标签的数据（内存优化：直接在CPU上操作）
+            train_samples_x, train_samples_y = [], []
+            test_samples_x, test_samples_y = [], []
 
-            # 限制样本数量以加速评估
-            if len(train_filtered) > self.max_samples_per_client:
-                train_indices = torch.randperm(len(train_filtered))[:self.max_samples_per_client]
-                train_filtered = torch.utils.data.Subset(train_filtered, train_indices)
+            # 收集训练数据中的目标标签样本
+            for batch_x, batch_y in train_loader:
+                # 确保在CPU上进行过滤，避免GPU内存累积
+                batch_x = batch_x.cpu()
+                batch_y = batch_y.cpu()
 
-            if len(test_filtered) > self.max_samples_per_client:
-                test_indices = torch.randperm(len(test_filtered))[:self.max_samples_per_client]
-                test_filtered = torch.utils.data.Subset(test_filtered, test_indices)
+                mask = (batch_y == target_label)
+                if mask.any():
+                    train_samples_x.append(batch_x[mask])
+                    train_samples_y.append(batch_y[mask])
+
+            # 收集测试数据中的目标标签样本
+            for batch_x, test_y in test_loader:
+                # 确保在CPU上进行过滤
+                batch_x = batch_x.cpu()
+                test_y = test_y.cpu()
+
+                mask = (test_y == target_label)
+                if mask.any():
+                    test_samples_x.append(batch_x[mask])
+                    test_samples_y.append(test_y[mask])
+
+            # 合并所有批次
+            if not train_samples_x or not test_samples_x:
+                # 清理内存
+                del train_samples_x, train_samples_y, test_samples_x, test_samples_y
+                torch.cuda.empty_cache() if torch.cuda.is_available() else None
+                return {
+                    'status': 'failed',
+                    'error': f'Insufficient data for label {target_label}'
+                }
+
+            train_x = torch.cat(train_samples_x, dim=0)
+            train_y = torch.cat(train_samples_y, dim=0)
+            test_x = torch.cat(test_samples_x, dim=0)
+            test_y = torch.cat(test_samples_y, dim=0)
+
+            # 立即清理临时列表
+            del train_samples_x, train_samples_y, test_samples_x, test_samples_y
+
+            print(f"[MIA Wrapper] Label {target_label}: Train samples={len(train_x)}, Test samples={len(test_x)}")
+
+            # 创建临时数据集用于评估（使用完整数据集）
+            from torch.utils.data import TensorDataset
+            train_filtered = TensorDataset(train_x, train_y)
+            test_filtered = TensorDataset(test_x, test_y)
 
             if len(train_filtered) == 0 or len(test_filtered) == 0:
                 return {
@@ -278,77 +410,146 @@ class FederatedMIAEvaluator:
             train_loader = DataLoader(train_filtered, batch_size=self.batch_size, shuffle=False)
             test_loader = DataLoader(test_filtered, batch_size=self.batch_size, shuffle=False)
 
-            # 获取模型输出和梯度
-            train_outputs, train_labels, train_head_grads, train_feat_grads = \
-                get_model_outputs_labels_and_grads(client_model, train_loader, self.device)
-
-            test_outputs, test_labels, test_head_grads, test_feat_grads = \
-                get_model_outputs_labels_and_grads(client_model, test_loader, self.device)
-
-            # 准备攻击模型输入
-            train_inputs = prepare_attack_model_inputs(train_outputs, train_head_grads, train_feat_grads)
-            test_inputs = prepare_attack_model_inputs(test_outputs, test_head_grads, test_feat_grads)
-
-            # 使用攻击模型进行预测
+            # 🔑 流式处理：逐batch处理，避免累积所有梯度
             attack_model = self.attack_models[target_label]
+            all_pred_scores = []
+            all_true_labels = []
 
-            with torch.no_grad():
-                # 成员数据（训练集）预测
-                train_preds = []
-                for i in range(len(train_inputs[0])):
-                    inputs = [inp[i:i+1].to(self.device) for inp in train_inputs]
-                    pred = attack_model(*inputs).cpu()
-                    train_preds.append(pred)
-                train_preds = torch.cat(train_preds, dim=0)
+            # 处理训练数据 (member = 1)
+            for batch_outputs, batch_labels, batch_head_grads, batch_feat_grads in \
+                    get_model_outputs_labels_and_grads_gpu(client_model, train_loader, self.device):
 
-                # 非成员数据（测试集）预测
-                test_preds = []
-                for i in range(len(test_inputs[0])):
-                    inputs = [inp[i:i+1].to(self.device) for inp in test_inputs]
-                    pred = attack_model(*inputs).cpu()
-                    test_preds.append(pred)
-                test_preds = torch.cat(test_preds, dim=0)
+                # 🔑 使用单batch版本的输入准备函数
+                batch_inputs = prepare_attack_model_inputs_single_gpu(
+                    batch_outputs, batch_head_grads, batch_feat_grads, self.device
+                )
 
-            # 计算攻击指标
-            train_scores = torch.sigmoid(train_preds).squeeze()
-            test_scores = torch.sigmoid(test_preds).squeeze()
+                # 攻击模型预测
+                with torch.no_grad():
+                    batch_preds = attack_model(*batch_inputs)
+                    batch_scores = batch_preds.squeeze(1)  # 攻击模型输出已经经过sigmoid，不需要再做一次
 
-            # 真实标签：训练数据为1（成员），测试数据为0（非成员）
-            true_labels = torch.cat([
-                torch.ones(len(train_scores)),
-                torch.zeros(len(test_scores))
-            ])
+                    # 只保存预测分数，不保存梯度
+                    all_pred_scores.append(batch_scores.detach())
+                    all_true_labels.append(torch.ones(len(batch_scores), device=self.device))
 
-            # 预测分数
-            pred_scores = torch.cat([train_scores, test_scores])
+                # 🔑 立即清理当前batch
+                del batch_outputs, batch_labels, batch_head_grads, batch_feat_grads
+                del batch_inputs, batch_preds, batch_scores
 
-            # 计算指标
-            metrics = self._calculate_metrics(pred_scores, true_labels)
+            # 处理测试数据 (non-member = 0)
+            for batch_outputs, batch_labels, batch_head_grads, batch_feat_grads in \
+                    get_model_outputs_labels_and_grads_gpu(client_model, test_loader, self.device):
+
+                # 🔑 使用单batch版本的输入准备函数
+                batch_inputs = prepare_attack_model_inputs_single_gpu(
+                    batch_outputs, batch_head_grads, batch_feat_grads, self.device
+                )
+
+                # 攻击模型预测
+                with torch.no_grad():
+                    batch_preds = attack_model(*batch_inputs)
+                    batch_scores = torch.sigmoid(batch_preds).squeeze(1)  # 只移除最后一维，保留batch维度
+
+                    # 只保存预测分数
+                    all_pred_scores.append(batch_scores.detach())
+                    all_true_labels.append(torch.zeros(len(batch_scores), device=self.device))
+
+                # 🔑 立即清理当前batch
+                del batch_outputs, batch_labels, batch_head_grads, batch_feat_grads
+                del batch_inputs, batch_preds, batch_scores
+
+            # 🔑 检查是否有数据
+            if not all_pred_scores or not all_true_labels:
+                return {
+                    'status': 'failed',
+                    'error': f'No predictions generated for label {target_label}'
+                }
+
+            # 合并所有预测结果
+            pred_scores = torch.cat(all_pred_scores)
+            true_labels = torch.cat(all_true_labels)
+
+            # 清理临时列表
+            del all_pred_scores, all_true_labels
+
+            # 计算指标（GPU上计算）
+            metrics = self._calculate_metrics(pred_scores, true_labels, use_gpu=True, label=target_label)
+
+            # 清理最终变量
+            del pred_scores, true_labels
+            del train_x, train_y, test_x, test_y
+            del train_filtered, test_filtered
+            del train_loader, test_loader  # 🔑 新增: 清理DataLoader
+
+            # 🔑 关键修复: 清理模型梯度
+            client_model.zero_grad()
+            for param in client_model.parameters():
+                if param.grad is not None:
+                    param.grad = None
+
+            # 强制垃圾回收
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             return {
                 'status': 'success',
                 'label': target_label,
-                'train_samples': len(train_filtered),
-                'test_samples': len(test_filtered),
+                'train_samples': metrics.get('tp', 0) + metrics.get('fn', 0),
+                'test_samples': metrics.get('tn', 0) + metrics.get('fp', 0),
                 **metrics
             }
 
         except Exception as e:
+            # 🔑 打印完整异常信息
+            print(f"[MIA Wrapper]   EXCEPTION in label {target_label}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+
+            # 异常时也要清理内存
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
             return {
                 'status': 'failed',
                 'error': f"Exception in label {target_label}: {str(e)}"
             }
 
-    def _calculate_metrics(self, pred_scores, true_labels, threshold=0.5):
-        """计算MIA攻击指标"""
+    def _calculate_metrics(self, pred_scores, true_labels, threshold=0.5, use_gpu=False, label=None):
+        """
+        计算MIA攻击指标
+
+        Args:
+            pred_scores: 预测分数 (CPU或GPU tensor)
+            true_labels: 真实标签 (CPU或GPU tensor)
+            threshold: 分类阈值
+            use_gpu: 是否使用GPU计算（True则输入已在GPU上）
+            label: 当前评估的label（用于debug输出）
+        """
+        # 🔍 DEBUG: 预测分数统计
+        pred_min = pred_scores.min().item()
+        pred_max = pred_scores.max().item()
+        pred_mean = pred_scores.mean().item()
+
         pred_binary = (pred_scores > threshold).int()
         true_binary = true_labels.int()
 
-        # 混淆矩阵
+        # 混淆矩阵（GPU上计算更快）
         tp = ((pred_binary == 1) & (true_binary == 1)).sum().item()
         fp = ((pred_binary == 1) & (true_binary == 0)).sum().item()
         tn = ((pred_binary == 0) & (true_binary == 0)).sum().item()
         fn = ((pred_binary == 0) & (true_binary == 1)).sum().item()
+
+        # 🔍 DEBUG: 详细统计
+        total = len(pred_scores)
+        pred_member_count = (pred_binary == 1).sum().item()
+        pred_non_member_count = (pred_binary == 0).sum().item()
+        true_member_count = (true_binary == 1).sum().item()
+        true_non_member_count = (true_binary == 0).sum().item()
 
         # 计算指标
         accuracy = (tp + tn) / (tp + fp + tn + fn) if (tp + fp + tn + fn) > 0 else 0.0
@@ -357,6 +558,21 @@ class FederatedMIAEvaluator:
         f_score = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
         tpr = recall  # True Positive Rate
         fpr = fp / (fp + tn) if (fp + tn) > 0 else 0.0  # False Positive Rate
+
+        # 🔍 DEBUG: 输出详细信息（只在F-score=0时）
+        if f_score == 0.0 and label is not None:
+            print(f"[MIA DEBUG] Label {label}:")
+            print(f"  Pred scores: min={pred_min:.4f}, max={pred_max:.4f}, mean={pred_mean:.4f}")
+            print(f"  Predictions: member={pred_member_count}, non-member={pred_non_member_count} (total={total})")
+            print(f"  Ground truth: member={true_member_count}, non-member={true_non_member_count}")
+            print(f"  Confusion matrix: TP={tp}, FP={fp}, TN={tn}, FN={fn}")
+            print(f"  Accuracy: {accuracy:.4f} ({tp+tn}/{total} correct)")
+            if pred_member_count == 0:
+                print(f"  → Attack model always predicts non-member (all scores <= 0.5)")
+                print(f"  → High accuracy ({accuracy:.2%}) is misleading - just predicting majority class!")
+            elif pred_non_member_count == 0:
+                print(f"  → Attack model always predicts member (all scores > 0.5)")
+                print(f"  → High accuracy ({accuracy:.2%}) is misleading - just predicting majority class!")
 
         return {
             'accuracy': accuracy,
@@ -390,7 +606,11 @@ class FederatedMIAEvaluator:
         评估所有客户端的MIA攻击成功率
 
         Args:
-            clients: 客户端列表
+            clients: 客户端列表，每个client必须有：
+                - client.id: 客户端ID
+                - client.model: 客户端模型
+                - client.load_train_data(): 返回训练数据DataLoader
+                - client.load_test_data(): 返回测试数据DataLoader
             round_num: 当前轮次
             dataset_name: 数据集名称
             save_results: 是否保存结果
@@ -410,6 +630,18 @@ class FederatedMIAEvaluator:
         print(f"[MIA Wrapper] Available attack models: {len(self.attack_models)}")
         print(f"[MIA Wrapper] Attack model labels: {list(self.attack_models.keys())}")
 
+        # 🔑 关键修改: 创建全局test data loader（合并所有clients的test data）
+        global_test_loader = None
+        if self.use_global_test:
+            print(f"[MIA Wrapper] Creating global test dataset from all clients...")
+            global_test_loader = self._create_global_test_loader(clients)
+            if global_test_loader is not None:
+                print(f"[MIA Wrapper] ✓ Using GLOBAL test data as non-member for all clients")
+            else:
+                print(f"[MIA Wrapper] Warning: Failed to create global test loader, falling back to per-client test data")
+        else:
+            print(f"[MIA Wrapper] Using each client's own test data as non-member")
+
         all_results = {
             'round': round_num,
             'timestamp': datetime.now().isoformat(),
@@ -420,61 +652,155 @@ class FederatedMIAEvaluator:
         }
 
         successful_evaluations = 0
-        all_f_scores = []
-        all_tprs = []
-        all_fprs = []
-        all_accuracies = []
+        # 🔑 优化：使用滚动统计而不是列表累积，减少内存
+        stats_accumulator = {
+            'sum_f_score': 0.0, 'sum_f_score_sq': 0.0,
+            'sum_tpr': 0.0, 'sum_fpr': 0.0, 'sum_accuracy': 0.0,
+            'max_f_score': -float('inf'), 'min_f_score': float('inf'),
+            'high_risk': 0, 'medium_risk': 0, 'low_risk': 0
+        }
 
-        for client in clients:
-            print(f"[MIA Wrapper] Evaluating client {client.id}...")
-            client_result = self.evaluate_client_mia(
-                client.model,
-                client.id,
-                dataset_name
-            )
+        for idx, client in enumerate(clients):
+            print(f"\n[MIA Wrapper] ({'='*60})")
+            print(f"[MIA Wrapper] Evaluating client {client.id} ({idx+1}/{len(clients)})...")
+
+            # 🔑 内存监控：评估前GPU状态
+            if torch.cuda.is_available():
+                gpu_mem_before = torch.cuda.memory_allocated(self.device) / 1024**3  # GB
+                print(f"[MIA Wrapper] GPU Memory before: {gpu_mem_before:.2f} GB")
+
+            # **关键修复**: 在评估前清理模型梯度
+            if hasattr(client, 'model') and client.model is not None:
+                client.model.zero_grad()
+                # 确保模型处于评估模式
+                client.model.eval()
+
+            client_result = self.evaluate_client_mia(client, global_test_loader=global_test_loader)  # 传入全局test loader
 
             all_results['clients'][client.id] = client_result
 
             if client_result['status'] == 'success':
                 successful_evaluations += 1
                 summary = client_result['summary']
-                all_f_scores.append(summary['avg_f_score'])
-                all_tprs.append(summary['avg_tpr'])
-                all_fprs.append(summary['avg_fpr'])
-                all_accuracies.append(summary['avg_accuracy'])
-                print(f"[MIA Wrapper] Client {client.id} evaluation successful, F-score: {summary['avg_f_score']:.4f}")
+                f_score = summary['avg_f_score']
+
+                # 🔑 滚动统计更新
+                stats_accumulator['sum_f_score'] += f_score
+                stats_accumulator['sum_f_score_sq'] += f_score ** 2
+                stats_accumulator['sum_tpr'] += summary['avg_tpr']
+                stats_accumulator['sum_fpr'] += summary['avg_fpr']
+                stats_accumulator['sum_accuracy'] += summary['avg_accuracy']
+                stats_accumulator['max_f_score'] = max(stats_accumulator['max_f_score'], f_score)
+                stats_accumulator['min_f_score'] = min(stats_accumulator['min_f_score'], f_score)
+
+                # 风险统计
+                if f_score > 0.8:
+                    stats_accumulator['high_risk'] += 1
+                elif f_score > 0.6:
+                    stats_accumulator['medium_risk'] += 1
+                else:
+                    stats_accumulator['low_risk'] += 1
+
+                print(f"[MIA Wrapper] Client {client.id} evaluation successful, F-score: {f_score:.4f}")
             else:
                 print(f"[MIA Wrapper] Client {client.id} evaluation failed: {client_result.get('error', 'Unknown error')}")
 
-        # 计算总体统计
-        if all_f_scores:
+            # **关键增强**: 评估后立即清理模型梯度和GPU缓存
+            if hasattr(client, 'model') and client.model is not None:
+                client.model.zero_grad()
+                # 清理未使用的张量
+                for param in client.model.parameters():
+                    if param.grad is not None:
+                        param.grad = None
+
+            # 🔑 强制垃圾回收和GPU缓存清理
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        # 🔑 从滚动统计计算总体统计（不使用列表）
+        if successful_evaluations > 0:
+            n = successful_evaluations
+            avg_f_score = stats_accumulator['sum_f_score'] / n
+            # 计算标准差: std = sqrt(E[X^2] - (E[X])^2)
+            variance = (stats_accumulator['sum_f_score_sq'] / n) - (avg_f_score ** 2)
+            std_f_score = np.sqrt(max(0, variance))  # max(0, ...) 防止数值误差导致负数
+
             all_results['summary'] = {
                 'successful_clients': successful_evaluations,
                 'total_clients': len(clients),
                 'success_rate': successful_evaluations / len(clients),
-                'avg_f_score': np.mean(all_f_scores),
-                'std_f_score': np.std(all_f_scores),
-                'avg_tpr': np.mean(all_tprs),
-                'avg_fpr': np.mean(all_fprs),
-                'avg_accuracy': np.mean(all_accuracies),
-                'max_f_score': np.max(all_f_scores),
-                'min_f_score': np.min(all_f_scores),
-                'high_risk_clients': sum(1 for score in all_f_scores if score > 0.8),
-                'medium_risk_clients': sum(1 for score in all_f_scores if 0.6 < score <= 0.8),
-                'low_risk_clients': sum(1 for score in all_f_scores if score <= 0.6)
+                'avg_f_score': avg_f_score,
+                'std_f_score': std_f_score,
+                'avg_tpr': stats_accumulator['sum_tpr'] / n,
+                'avg_fpr': stats_accumulator['sum_fpr'] / n,
+                'avg_accuracy': stats_accumulator['sum_accuracy'] / n,
+                'max_f_score': stats_accumulator['max_f_score'],
+                'min_f_score': stats_accumulator['min_f_score'],
+                'high_risk_clients': stats_accumulator['high_risk'],
+                'medium_risk_clients': stats_accumulator['medium_risk'],
+                'low_risk_clients': stats_accumulator['low_risk']
             }
         else:
             all_results['status'] = 'failed'
             all_results['error'] = 'No successful client evaluations'
 
+        # 清理统计累加器
+        del stats_accumulator
+
         # 保存结果
         if save_results:
             self._save_results(all_results, results_dir)
 
-        # 添加到历史记录
-        self.evaluation_history.append(all_results)
+        # **关键修复**: 只保存轻量级的历史记录，不保存完整的all_results
+        # 避免evaluation_history无限增长导致内存爆炸
+        lightweight_entry = {
+            'round': round_num,
+            'timestamp': all_results['timestamp'],
+            'status': all_results['status'],
+            'summary': all_results.get('summary', {})
+        }
+        self.evaluation_history.append(lightweight_entry)
 
-        return all_results
+        # 限制历史记录长度（只保留最近50轮）
+        if len(self.evaluation_history) > 50:
+            self.evaluation_history = self.evaluation_history[-50:]
+
+        # **关键修复**: 清理all_results中的详细数据，只返回摘要
+        # 这样可以避免调用者持有大量数据
+        lightweight_results = {
+            'round': round_num,
+            'timestamp': all_results['timestamp'],
+            'dataset': dataset_name,
+            'summary': all_results.get('summary', {}),
+            'status': all_results['status'],
+            'clients': {}  # 只返回client F-score，不返回详细结果
+        }
+
+        # 只保留每个client的F-score，删除详细的label_results
+        for client_id, client_result in all_results['clients'].items():
+            if client_result['status'] == 'success' and 'summary' in client_result:
+                lightweight_results['clients'][client_id] = {
+                    'status': 'success',
+                    'summary': {'avg_f_score': client_result['summary']['avg_f_score']}
+                }
+
+        # 🔑 清理原始的all_results和global_test_loader
+        del all_results
+        if global_test_loader is not None:
+            del global_test_loader
+            print(f"[MIA Wrapper] Global test loader cleaned up")
+
+        # 🔑 强制垃圾回收和GPU缓存清理
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            final_gpu_mem = torch.cuda.memory_allocated(self.device) / 1024**3
+            print(f"[MIA Wrapper] Final GPU Memory: {final_gpu_mem:.2f} GB")
+
+        return lightweight_results
 
     def _save_results(self, results, results_dir):
         """保存MIA评估结果"""
@@ -489,12 +815,21 @@ class FederatedMIAEvaluator:
             with open(detailed_path, 'w') as f:
                 json.dump(results, f, indent=2, default=str)
 
-            # 保存简化的历史记录
+            # 保存简化的历史记录（包含每个client的F-score）
             history_file = os.path.join(results_dir, "mia_history.json")
+
+            # 提取每个client的F-score
+            client_f_scores = {}
+            if 'clients' in results:
+                for client_id, client_result in results['clients'].items():
+                    if client_result['status'] == 'success' and 'summary' in client_result:
+                        client_f_scores[str(client_id)] = client_result['summary']['avg_f_score']
+
             history_entry = {
                 'round': results['round'],
                 'timestamp': results['timestamp'],
-                'summary': results.get('summary', {})
+                'summary': results.get('summary', {}),
+                'client_f_scores': client_f_scores  # 新增：每个client的F-score
             }
 
             # 读取现有历史或创建新的
@@ -510,6 +845,9 @@ class FederatedMIAEvaluator:
 
             with open(history_file, 'w') as f:
                 json.dump(history, f, indent=2, default=str)
+
+            print(f"[MIA Wrapper] Results saved to: {detailed_path}")
+            print(f"[MIA Wrapper] History updated: {history_file}")
 
         except Exception as e:
             print(f"[MIA Wrapper] Failed to save results: {e}")
@@ -552,6 +890,74 @@ class FederatedMIAEvaluator:
                         )
 
         return trends
+
+    def export_client_f_scores_to_csv(self, results_dir: str = "mia_results", output_filename: str = "client_f_scores.csv"):
+        """
+        将每轮每个client的F-score导出为CSV文件，方便可视化
+
+        Args:
+            results_dir: 结果目录
+            output_filename: 输出CSV文件名
+
+        Returns:
+            str: CSV文件路径，如果失败返回None
+        """
+        history_file = os.path.join(results_dir, "mia_history.json")
+
+        if not os.path.exists(history_file):
+            print(f"[MIA Wrapper] History file not found: {history_file}")
+            return None
+
+        try:
+            # 读取历史记录
+            with open(history_file, 'r') as f:
+                history = json.load(f)
+
+            if not history:
+                print(f"[MIA Wrapper] No history data available")
+                return None
+
+            # 收集所有client ID
+            all_client_ids = set()
+            for entry in history:
+                if 'client_f_scores' in entry:
+                    all_client_ids.update(entry['client_f_scores'].keys())
+
+            all_client_ids = sorted(all_client_ids, key=lambda x: int(x))
+
+            # 创建CSV内容
+            import csv
+            csv_path = os.path.join(results_dir, output_filename)
+
+            with open(csv_path, 'w', newline='') as f:
+                writer = csv.writer(f)
+
+                # 写入表头
+                header = ['round'] + [f'client_{cid}' for cid in all_client_ids]
+                writer.writerow(header)
+
+                # 写入数据
+                for entry in history:
+                    round_num = entry['round']
+                    client_f_scores = entry.get('client_f_scores', {})
+
+                    row = [round_num]
+                    for cid in all_client_ids:
+                        f_score = client_f_scores.get(str(cid), '')  # 如果该client没有数据，留空
+                        row.append(f_score)
+
+                    writer.writerow(row)
+
+            print(f"[MIA Wrapper] Client F-scores exported to: {csv_path}")
+            print(f"[MIA Wrapper] Total rounds: {len(history)}, Total clients: {len(all_client_ids)}")
+
+            return csv_path
+
+        except Exception as e:
+            print(f"[MIA Wrapper] Failed to export CSV: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
 
     def _read_client_data_custom(self, dataset_base_path, is_train=True, is_shadow=True, num_clients=5, alpha=1):
         """

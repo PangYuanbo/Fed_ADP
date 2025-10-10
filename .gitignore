@@ -127,8 +127,66 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# ==========================================
+# Project-Specific: FedCP with MIA and RL-DP
+# ==========================================
+
+# === 数据集 (16GB+) - 本地保留 ===
 /dataset/
-/dataset/cifar-10-normal/test/
+/public_cifar10_data_iid_5percent/
+/system/cifar10_data_main/
+/system/Membership_Inference_Attack/dataset/
+
+# === 训练模型和权重文件 (17GB+) ===
+*.pth
+*.pkl
+*.h5
+*.ckpt
+*.weights
+*.model
+/system/Membership_Inference_Attack/attack/
+/system/Membership_Inference_Attack/normal_model/
+/system/Membership_Inference_Attack/shadow_model/
+/system/Membership_Inference_Attack/dp_model/
+/system/Membership_Inference_Attack/mnist-*/
+/system/Membership_Inference_Attack/cifar-*/
+/system/pretrain/
+/system/rl_checkpoints/
+
+# === 实验结果和日志文件 ===
+/system/results/
+/system/results_after/
+/system/mia_results/
 /system/logs/
-/system/Membership_Inference_Attack/view_dp/
+/system/clip_value/
+/system/rl_summaries/
+
+# === Jupyter Notebooks和可视化 ===
+*.ipynb
+/system/notebooks_archive/
 /system/Membership_Inference_Attack/view/
+/system/Membership_Inference_Attack/view_dp/
+/system/Membership_Inference_Attack/membership_attack.ipynb
+/prob5.ipynb
+
+# === IDE和编辑器配置 ===
+.idea/
+.vscode/
+.claude/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# === 临时和系统文件 ===
+nul
+*.tmp
+*.bak
+*.orig
+*.backup
+Thumbs.db
+
+# === 旧版本备份 (建议删除) ===
+/Membership_Inference_Attack0/
+/test_dtfs.py

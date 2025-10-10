@@ -8,10 +8,15 @@ from flcore.clients.clientcp import *
 try:
     from flcore.clients.clientcp_rl import clientCP_RL
     RL_CLIENT_AVAILABLE = True
-    print("[Server] RL client available")
 except ImportError:
     RL_CLIENT_AVAILABLE = False
-    print("[Server] RL client not available, using standard clients")
+
+# 尝试导入连续RL客户端（可选）
+try:
+    from flcore.clients.clientcp_continuous_rl import clientCP_ContinuousRL
+    CONTINUOUS_RL_CLIENT_AVAILABLE = True
+except ImportError:
+    CONTINUOUS_RL_CLIENT_AVAILABLE = False
 from utils.data_utils import read_client_data
 from threading import Thread
 import os
@@ -43,24 +48,41 @@ class FedCP:
         self.times = times
         self.eval_gap = args.eval_gap
 
-        # 检查是否使用RL客户端
+        # 检查使用哪种RL客户端
+        use_continuous_rl = getattr(args, 'use_continuous_rl', False)
         self.use_rl_clients = (getattr(args, 'enable_rl_dp', False) and
-                              args.difference_privacy and
-                              RL_CLIENT_AVAILABLE)
+                              args.difference_privacy)
 
         result_dir = "results"
+
+        # 只在使用RL时打印RL客户端信息
+        if self.use_rl_clients:
+            if use_continuous_rl and CONTINUOUS_RL_CLIENT_AVAILABLE:
+                print(f"[Server] Using Continuous RL clients (DDPG)")
+            elif RL_CLIENT_AVAILABLE:
+                print(f"[Server] Using Discrete RL clients (DQN)")
+            else:
+                print(f"[Server] RL requested but not available, using standard clients")
+
         for i in range(self.num_clients):
             train_data = read_client_data(self.dataset, i, is_train=True,alpha=self.alpha)
             test_data = read_client_data(self.dataset, i, is_train=False,alpha=self.alpha)
 
             # 根据配置创建相应的客户端
-            if self.use_rl_clients:
+            if self.use_rl_clients and use_continuous_rl and CONTINUOUS_RL_CLIENT_AVAILABLE:
+                # 使用连续RL客户端（DDPG）
+                client = clientCP_ContinuousRL(args,
+                                              id=i,
+                                              train_samples=len(train_data),
+                                              test_samples=len(test_data))
+            elif self.use_rl_clients and RL_CLIENT_AVAILABLE:
+                # 使用离散RL客户端（DQN）
                 client = clientCP_RL(args,
                                    id=i,
                                    train_samples=len(train_data),
                                    test_samples=len(test_data))
-                print(f"[Server] Created RL client {i}")
             else:
+                # 使用标准客户端
                 client = clientCP(args,
                                 id=i,
                                 train_samples=len(train_data),
@@ -98,9 +120,10 @@ class FedCP:
                     attack_model_dir="Membership_Inference_Attack",
                     num_classes=args.num_classes,
                     device=args.device,
-                    batch_size=1,
+                    batch_size=1,  # 与原版MIA一致
                     alpha=args.alpha,
-                    max_samples_per_client=50  # Limit samples for faster evaluation
+                    max_samples_per_client=None,  # None表示使用完整数据集
+                    use_gpu_optimization=True  # 🔑 强制启用GPU优化，所有计算图在GPU上
                 )
                 print(f"[Server] Federated MIA evaluator initialized successfully")
                 print(f"[Server] MIA evaluation will run every {self.mia_evaluation_interval} rounds")
@@ -154,16 +177,27 @@ class FedCP:
         tot_auc = []
         result_dir = "results"
         os.makedirs(result_dir, exist_ok=True)
+
+        # 计算训练准确率
+        print("\n[Per-Client Train Accuracy]")
+        for c in self.clients:
+            train_ct, train_ns = c.train_metrics()
+            train_acc = train_ct * 1.0 / train_ns if train_ns > 0 else 0.0
+            print(f'  Client {c.id}: Train Acc = {train_acc:.4f} ({train_ct}/{train_ns})')
+
+        # 计算测试准确率
+        print("\n[Per-Client Test Accuracy]")
         for c in self.clients:
             ct, ns, auc = c.test_metrics_before()
-            # print(f'Client {c.id}: Acc: {ct*1.0/ns}, AUC: {auc}')
+            acc = ct * 1.0 / ns
+            print(f'  Client {c.id}: Test Acc = {acc:.4f} ({ct}/{ns}), AUC = {auc:.4f}')
             tot_correct.append(ct*1.0)
             tot_auc.append(auc*ns)
             num_samples.append(ns)
             filename=f"results_{self.dataset}_{c.id}.txt"
             file_path = os.path.join(result_dir, filename)
             with open(file_path, "a") as f:
-                f.write(f"Round {c.round}: ACC = {ct*1.0/ns:.4f}\n")
+                f.write(f"Round {c.round}: Test ACC = {acc:.4f}\n")
 
 
 
@@ -313,22 +347,51 @@ class FedCP:
                 print(f"Min F-score: {np.min(all_f_scores):.4f}")
                 print(f"F-score std: {np.std(all_f_scores):.4f}")
 
-                # Generate MIA trend visualization
+                # Generate MIA visualizations
                 try:
                     from utils.mia_visualizer import MIAVisualizer
                     visualizer = MIAVisualizer()
+                    results_dir = f"mia_results/{args.dataset}_alpha{args.alpha}"
 
-                    # Generate F-score trend plot
+                    # Generate main F-score trend plot (4 subplots)
                     plot_path = visualizer.plot_f_score_trends(
                         self.mia_results_history,
-                        save_dir=f"mia_results/{args.dataset}_alpha{args.alpha}",
+                        save_dir=results_dir,
                         dataset_name=args.dataset,
                         alpha=args.alpha
                     )
-                    print(f"MIA trend visualization saved to: {plot_path}")
+                    print(f"[Server] MIA trend visualization saved to: {plot_path}")
+
+                    # Generate per-client detailed plot
+                    client_plot_path = visualizer.plot_per_client_f_scores(
+                        self.mia_results_history,
+                        save_dir=results_dir,
+                        dataset_name=args.dataset,
+                        alpha=args.alpha
+                    )
+                    print(f"[Server] Per-client MIA plot saved to: {client_plot_path}")
+
+                    # Generate summary report
+                    report_path = visualizer.create_summary_report(
+                        self.mia_results_history,
+                        save_dir=results_dir,
+                        dataset_name=args.dataset,
+                        alpha=args.alpha
+                    )
+                    print(f"[Server] MIA summary report saved to: {report_path}")
+
+                    # Export CSV for external analysis
+                    csv_path = self.mia_evaluator.export_client_f_scores_to_csv(
+                        results_dir=results_dir,
+                        output_filename="client_f_scores.csv"
+                    )
+                    if csv_path:
+                        print(f"[Server] Client F-scores CSV exported to: {csv_path}")
 
                 except Exception as e:
-                    print(f"Warning: Could not generate MIA visualization: {e}")
+                    print(f"[Server] Warning: Could not generate MIA visualizations: {e}")
+                    import traceback
+                    traceback.print_exc()
 
             else:
                 print("No successful MIA evaluations recorded.")
@@ -388,7 +451,8 @@ class FedCP:
                     client.update_mia_score(mia_f_score)
                     updated_count += 1
 
-        if updated_count > 0:
+        # 只在RL模式下打印
+        if updated_count > 0 and self.use_rl_clients:
             print(f"[Server] Updated MIA scores for {updated_count} RL clients")
 
 

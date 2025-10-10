@@ -9,12 +9,16 @@ from torch.utils.data import TensorDataset, Subset
 
 
 def read_data(is_train=True, is_shadow=True, num_clients=5,alpha=1):
+    # 将alpha格式化为整数（如果是整数值），以匹配目录结构
+    # 例如：1.0 -> "1", 0.5 -> "0.5"
+    alpha_str = str(int(alpha)) if alpha == int(alpha) else str(alpha)
+
     data_list = []
     for i in range(num_clients):
         if is_shadow:
-            file_name = f"dataset/{alpha}/{'cifar-10-shadow/train/train' if is_train else 'cifar-10-shadow/test/test'}{i}_.npz"
+            file_name = f"dataset/{alpha_str}/{'cifar-10-shadow/train/train' if is_train else 'cifar-10-shadow/test/test'}{i}_.npz"
         else:
-            file_name = f"dataset/{alpha}/{'cifar-10-normal/train/train' if is_train else 'cifar-10-normal/test/test'}{i}_.npz"
+            file_name = f"dataset/{alpha_str}/{'cifar-10-normal/train/train' if is_train else 'cifar-10-normal/test/test'}{i}_.npz"
         if not os.path.exists(file_name):
             raise FileNotFoundError(f"File {file_name} not found.")
         with open(file_name, 'rb') as f:

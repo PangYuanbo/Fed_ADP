@@ -77,7 +77,8 @@ class clientCP_RL:
         self.opt = torch.optim.SGD(self.model.parameters(), lr=self.learning_rate)
 
         # ============= RL 相关初始化 =============
-        self.enable_rl = getattr(args, 'enable_rl_dp', True)  # 默认启用RL
+        self.enable_rl = getattr(args, 'enable_rl_dp', False)  # 默认不启用RL
+        self.rl_verbose = getattr(args, 'rl_verbose', False)  # 是否显示RL日志
         self.rl_agent = None
         self.rl_manager = None
         self.current_accuracy = 0.0
@@ -91,14 +92,16 @@ class clientCP_RL:
                     learning_rate=getattr(args, 'rl_learning_rate', 0.01),
                     epsilon=getattr(args, 'rl_epsilon', 0.1),
                     epsilon_decay=getattr(args, 'rl_epsilon_decay', 0.995),
-                    device=self.device
+                    device=self.device,
+                    verbose=self.rl_verbose
                 )
 
                 # 初始化RL管理器
                 self.rl_manager = RLDPManager(
                     agent=self.rl_agent,
                     update_interval=getattr(args, 'rl_update_interval', 10),
-                    min_rounds_before_rl=getattr(args, 'rl_min_rounds', 20)
+                    min_rounds_before_rl=getattr(args, 'rl_min_rounds', 20),
+                    verbose=self.rl_verbose
                 )
 
                 # RL检查点文件路径
@@ -110,12 +113,15 @@ class clientCP_RL:
 
                 # 尝试加载之前的检查点
                 if os.path.exists(self.rl_checkpoint_path):
-                    self.rl_manager.load_checkpoint(self.rl_checkpoint_path)
-                    print(f"[Client {self.id}] Loaded RL checkpoint from {self.rl_checkpoint_path}")
+                    self.rl_manager.load_checkpoint(self.rl_checkpoint_path, verbose=self.rl_verbose)
+                    if self.rl_verbose:
+                        print(f"[Client {self.id}] Loaded RL checkpoint from {self.rl_checkpoint_path}")
                 else:
-                    print(f"[Client {self.id}] Starting fresh RL training")
+                    if self.rl_verbose:
+                        print(f"[Client {self.id}] Starting fresh RL training")
 
-                print(f"[Client {self.id}] RL-DP system initialized successfully")
+                if self.rl_verbose:
+                    print(f"[Client {self.id}] RL-DP system initialized successfully")
 
             except Exception as e:
                 print(f"[Client {self.id}] Failed to initialize RL system: {e}")
@@ -187,6 +193,28 @@ class clientCP_RL:
             headw_p = torch.matmul(headw_p, mat)
         headw_p.detach_()
         self.context = torch.sum(headw_p, dim=0, keepdim=True)
+
+    def train_metrics(self):
+        """计算训练集上的准确率"""
+        trainloader = self.load_train_data()
+        self.model.eval()
+
+        train_acc = 0
+        train_num = 0
+
+        with torch.no_grad():
+            for x, y in trainloader:
+                if type(x) == type([]):
+                    x[0] = x[0].to(self.device)
+                else:
+                    x = x.to(self.device)
+                y = y.to(self.device)
+                output = self.model(x)
+
+                train_acc += (torch.sum(torch.argmax(output, dim=1) == y)).item()
+                train_num += y.shape[0]
+
+        return train_acc, train_num
 
     def test_metrics_before(self):
         testloader = self.load_test_data()
@@ -401,11 +429,13 @@ class clientCP_RL:
                 rl_thresholds = self.get_rl_adaptive_thresholds()
                 if rl_thresholds is not None:
                     threshold_1_percentile, threshold_2_percentile = rl_thresholds
-                    print(f"[Client {self.id}] Round {self.round}: Using RL thresholds ({threshold_1_percentile:.2f}, {threshold_2_percentile:.2f})")
+                    if self.rl_verbose:
+                        print(f"[Client {self.id}] Round {self.round}: Using RL thresholds ({threshold_1_percentile:.2f}, {threshold_2_percentile:.2f})")
                 else:
                     # 使用默认阈值
                     threshold_1_percentile, threshold_2_percentile = 0.6, 0.4
-                    print(f"[Client {self.id}] Round {self.round}: Using default thresholds ({threshold_1_percentile:.2f}, {threshold_2_percentile:.2f})")
+                    if self.rl_verbose:
+                        print(f"[Client {self.id}] Round {self.round}: Using default thresholds ({threshold_1_percentile:.2f}, {threshold_2_percentile:.2f})")
 
                 # 应用RL选择的阈值
                 threshold_1 = torch.quantile(diff.abs().view(-1), threshold_1_percentile)

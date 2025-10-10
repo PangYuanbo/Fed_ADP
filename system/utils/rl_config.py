@@ -56,8 +56,10 @@ class RLDPConfig:
             parser: ArgumentParser对象
         """
         # RL启用开关
-        parser.add_argument('--enable_rl_dp', type=bool, default=True,
-                            help="Enable RL-based adaptive differential privacy")
+        parser.add_argument('--enable_rl_dp', type=int, default=0,
+                            help="Enable RL-based adaptive differential privacy (0=False, 1=True)")
+        parser.add_argument('--rl_verbose', type=int, default=0,
+                            help="Enable verbose logging for RL-DP system (0=False, 1=True)")
 
         # RL智能体参数
         parser.add_argument('--rl_learning_rate', type=float, default=self.rl_learning_rate,
@@ -211,7 +213,7 @@ def create_rl_args_parser():
     parser = argparse.ArgumentParser(description="RL-Adaptive Differential Privacy Federated Learning")
 
     # 添加原有的联邦学习参数
-    parser.add_argument('-dp', '--difference_privacy', type=bool, default=False)
+    parser.add_argument('-dp', '--difference_privacy', type=int, default=0, help="Enable differential privacy (0=False, 1=True)")
     parser.add_argument('-dpn', '--difference_privacy_number', type=float, default=5)
     parser.add_argument('-dpl', '--difference_privacy_layer', type=str, default="model.head")
     parser.add_argument('-dev', "--device", type=str, default="cuda", choices=["cpu", "cuda"])
@@ -225,14 +227,14 @@ def create_rl_args_parser():
     parser.add_argument('-ls', "--local_steps", type=int, default=1)
     parser.add_argument('-algo', "--algorithm", type=str, default="FedGP")
     parser.add_argument('-jr', "--join_ratio", type=float, default=1.0)
-    parser.add_argument('-rjr', "--random_join_ratio", type=bool, default=False)
+    parser.add_argument('-rjr', "--random_join_ratio", type=int, default=0, help="Random join ratio (0=False, 1=True)")
     parser.add_argument('-nc', "--num_clients", type=int, default=20)
     parser.add_argument('-pv', "--prev", type=int, default=0)
     parser.add_argument('-t', "--times", type=int, default=1)
     parser.add_argument('-eg', "--eval_gap", type=int, default=1)
-    parser.add_argument('-al', "--alpha", type=float, default=1)
+    parser.add_argument('-al', "--alpha", type=int, default=1)
     parser.add_argument('-lam', "--lamda", type=float, default=0.0)
-    parser.add_argument('-mia', "--enable_mia", type=bool, default=False)
+    parser.add_argument('-mia', "--enable_mia", type=int, default=0, help="Enable MIA evaluation (0=False, 1=True)")
 
     # 添加RL相关参数
     rl_dp_config.add_rl_args(parser)

@@ -110,7 +110,8 @@ class FedCP_RL:
                     device=args.device,
                     batch_size=1,
                     alpha=args.alpha,
-                    max_samples_per_client=50  # 限制样本数量以加速评估
+                    max_samples_per_client=None,  # 🔑 使用完整数据集，不限制样本数量
+                    use_gpu_optimization=True  # 🔑 强制启用GPU优化，所有计算图在GPU上
                 )
                 print(f"[Server] Federated MIA evaluator initialized successfully")
                 print(f"[Server] MIA evaluation will run every {self.mia_evaluation_interval} rounds")
