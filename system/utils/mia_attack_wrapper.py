@@ -601,7 +601,8 @@ class FederatedMIAEvaluator:
                            round_num: int,
                            dataset_name: str,
                            save_results: bool = True,
-                           results_dir: str = "mia_results") -> Dict:
+                           results_dir: str = "mia_results",
+                           training_config: Optional[Dict] = None) -> Dict:
         """
         评估所有客户端的MIA攻击成功率
 
@@ -751,7 +752,7 @@ class FederatedMIAEvaluator:
 
         # 保存结果
         if save_results:
-            self._save_results(all_results, results_dir)
+            self._save_results(all_results, results_dir, training_config)
 
         # **关键修复**: 只保存轻量级的历史记录，不保存完整的all_results
         # 避免evaluation_history无限增长导致内存爆炸
@@ -802,21 +803,88 @@ class FederatedMIAEvaluator:
 
         return lightweight_results
 
-    def _save_results(self, results, results_dir):
-        """保存MIA评估结果"""
+    def _save_results(self, results, results_dir, training_config=None):
+        """
+        保存MIA评估结果（使用MIAManager进行参数化管理）
+
+        Args:
+            results: MIA评估结果字典
+            results_dir: 结果保存目录（如果使用MIAManager则会被覆盖）
+            training_config: 训练配置字典（用于创建参数化目录）
+        """
         try:
-            os.makedirs(results_dir, exist_ok=True)
+            # 如果提供了训练配置，使用MIAManager创建参数化目录
+            actual_results_dir = results_dir
+
+            if training_config:
+                try:
+                    from utils.mia_manager import MIAManager
+
+                    manager = MIAManager()
+
+                    # 从配置中提取参数
+                    dataset = training_config.get('dataset', 'unknown')
+                    alpha = training_config.get('alpha', 1.0)
+                    dp_noise = training_config.get('dp_noise', 0.0)
+                    enable_rl = training_config.get('enable_rl', False)
+
+                    # 检查是否需要创建新目录（第一轮评估时）
+                    if results['round'] == 10:  # 通常第一次评估是第10轮
+                        # 创建参数化运行目录
+                        actual_results_dir = manager.create_run_directory(
+                            dataset=dataset,
+                            alpha=alpha,
+                            dp_noise=dp_noise,
+                            enable_rl=enable_rl
+                        )
+
+                        # 保存训练配置
+                        manager.save_config(actual_results_dir, training_config)
+
+                        print(f"[MIA Wrapper] Created new run directory: {actual_results_dir}")
+                    else:
+                        # 查找现有运行目录
+                        found_dir = manager.find_run_by_params(
+                            dataset=dataset,
+                            alpha=alpha,
+                            dp_noise=dp_noise,
+                            enable_rl=enable_rl,
+                            return_latest=True
+                        )
+
+                        if found_dir:
+                            actual_results_dir = found_dir
+                            print(f"[MIA Wrapper] Using existing run directory: {actual_results_dir}")
+                        else:
+                            # 如果没找到，创建新的
+                            actual_results_dir = manager.create_run_directory(
+                                dataset=dataset,
+                                alpha=alpha,
+                                dp_noise=dp_noise,
+                                enable_rl=enable_rl
+                            )
+                            manager.save_config(actual_results_dir, training_config)
+                            print(f"[MIA Wrapper] Created new run directory: {actual_results_dir}")
+
+                except ImportError:
+                    print("[MIA Wrapper] Warning: MIAManager not available, using default directory")
+                except Exception as e:
+                    print(f"[MIA Wrapper] Warning: Failed to use MIAManager: {e}")
+                    print("[MIA Wrapper] Falling back to default directory")
+
+            # 确保目录存在
+            os.makedirs(actual_results_dir, exist_ok=True)
 
             # 保存详细结果
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             detailed_file = f"mia_detailed_round_{results['round']}_{timestamp}.json"
-            detailed_path = os.path.join(results_dir, detailed_file)
+            detailed_path = os.path.join(actual_results_dir, detailed_file)
 
             with open(detailed_path, 'w') as f:
                 json.dump(results, f, indent=2, default=str)
 
             # 保存简化的历史记录（包含每个client的F-score）
-            history_file = os.path.join(results_dir, "mia_history.json")
+            history_file = os.path.join(actual_results_dir, "mia_history.json")
 
             # 提取每个client的F-score
             client_f_scores = {}
@@ -851,6 +919,8 @@ class FederatedMIAEvaluator:
 
         except Exception as e:
             print(f"[MIA Wrapper] Failed to save results: {e}")
+            import traceback
+            traceback.print_exc()
 
     def get_f_score_trends(self) -> Dict:
         """获取F-score趋势数据用于绘图"""

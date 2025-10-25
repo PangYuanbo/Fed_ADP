@@ -7,8 +7,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from torch.utils.data import DataLoader, TensorDataset, Subset, ConcatDataset
-from mia_attack_utils import get_model_outputs_labels_and_grads, prepare_attack_model_inputs
-from data_utils import read_client_data, filter_by_label
+from .mia_attack_utils import get_model_outputs_labels_and_grads, prepare_attack_model_inputs
+from .data_utils import read_client_data, filter_by_label
 
 
 # ============================

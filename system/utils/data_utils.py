@@ -5,8 +5,11 @@ from sympy.abc import alpha
 
 
 def read_data(dataset, idx, is_train=True,alpha=1):
+    # 将alpha转换为整数（如果是1.0则变成1）以匹配目录名
+    alpha_dir = int(alpha) if alpha == int(alpha) else alpha
+
     if is_train:
-        train_data_dir = os.path.join(f'../dataset/{alpha}', dataset, 'train/')
+        train_data_dir = os.path.join(f'../dataset/{alpha_dir}', dataset, 'train/')
 
         train_file = train_data_dir+'train' + str(idx) + '_.npz'
         with open(train_file, 'rb') as f:
@@ -15,7 +18,7 @@ def read_data(dataset, idx, is_train=True,alpha=1):
         return train_data
 
     else:
-        test_data_dir = os.path.join(f'../dataset/{alpha}', dataset, 'test/')
+        test_data_dir = os.path.join(f'../dataset/{alpha_dir}', dataset, 'test/')
 
         test_file = test_data_dir+'test' + str(idx) + '_.npz'
         with open(test_file, 'rb') as f:

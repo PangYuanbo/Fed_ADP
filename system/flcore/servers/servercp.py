@@ -109,9 +109,16 @@ class FedCP:
         self.enable_mia = getattr(args, 'enable_mia', True)  # Default enabled for testing
         self.mia_results_history = []  # Store MIA results over time
 
+        # 获取实验ID（用于文件隔离）
+        self.exp_id = os.environ.get('MIA_EXP_ID', None)
+        self.mia_results_base_dir = os.environ.get('MIA_RESULTS_DIR', None)
+
         if self.enable_mia:
             try:
                 print(f"[Server] Initializing MIA evaluator...")
+                if self.exp_id:
+                    print(f"[Server] Experiment ID: {self.exp_id}")
+                    print(f"[Server] MIA Results Dir: {self.mia_results_base_dir}")
                 print(f"[Server] Attack model dir: Membership_Inference_Attack")
                 print(f"[Server] Device: {args.device}")
                 print(f"[Server] Num classes: {args.num_classes}")
@@ -278,12 +285,18 @@ class FedCP:
             if self.enable_mia and self.mia_evaluator and i > 0 and i % self.mia_evaluation_interval == 0:
                 print(f"\n[Server] Running MIA evaluation for round {i}...")
                 try:
+                    # 使用唯一的MIA结果目录（如果设置了实验ID）
+                    if self.mia_results_base_dir:
+                        mia_dir = self.mia_results_base_dir
+                    else:
+                        mia_dir = f"mia_results/{args.dataset}_alpha{args.alpha}"
+
                     mia_results = self.mia_evaluator.evaluate_all_clients(
                         self.clients,
                         round_num=i,
                         dataset_name=args.dataset,
                         save_results=True,
-                        results_dir=f"mia_results/{args.dataset}_alpha{args.alpha}"
+                        results_dir=mia_dir
                     )
 
                     self.mia_results_history.append(mia_results)

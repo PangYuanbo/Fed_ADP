@@ -14,10 +14,10 @@ from pathlib import Path
 from typing import Dict, List, Optional, Union
 
 # 导入现有模块
-from model import FedAvgCNN, LocalModel, GradientMIA
-from whitebox_mia_pipeline import whitebox_membership_inference_attack_pipeline
-from train_attack_model import train_attack_model
-from evaluate_client_accuracy import evaluate_all_clients_accuracy
+from .model import FedAvgCNN, LocalModel, GradientMIA
+from .whitebox_mia_pipeline import whitebox_membership_inference_attack_pipeline
+from .train_attack_model import train_attack_model
+from .evaluate_client_accuracy import evaluate_all_clients_accuracy
 
 
 class MIAAttackInterface:

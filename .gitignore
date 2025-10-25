@@ -161,6 +161,9 @@ dmypy.json
 /system/logs/
 /system/clip_value/
 /system/rl_summaries/
+/system/federated_mask_results/
+/system/threshold_experiments/
+/system/mask_training/
 
 # === Jupyter Notebooks和可视化 ===
 *.ipynb
@@ -190,3 +193,12 @@ Thumbs.db
 # === 旧版本备份 (建议删除) ===
 /Membership_Inference_Attack0/
 /test_dtfs.py
+
+# === 工具脚本和实验代码 (不跟踪) ===
+/system/list_pretrained_models.py
+/system/print_mia.py
+/system/print_mia_fscore.py
+/system/train_federated_masks.py
+/system/verify_mask_installation.py
+/system/utils/mia_manager.py
+/system/rl_lab/

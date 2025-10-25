@@ -32,6 +32,18 @@ class clientCP:
         self.loss = nn.CrossEntropyLoss()
         self.optimizer = torch.optim.SGD(self.model.parameters(), lr=self.learning_rate)
         self.round = 0
+
+        # DP阈值参数（支持外部配置）
+        self.threshold_high = getattr(args, 'threshold_high', 0.6)
+        self.threshold_low = getattr(args, 'threshold_low', 0.4)
+        self.clip_value = getattr(args, 'clip_value', 0.005)
+        self.epsilon = getattr(args, 'epsilon', 0.8)
+        self.delta = getattr(args, 'delta', 1e-5)
+        self.global_noise = getattr(args, 'global_noise', False)
+
+        # Layer-wise noise selection parameters
+        self.layer_noise_mode = getattr(args, 'layer_noise_mode', 'threshold')
+        self.layer_noise_ratio = getattr(args, 'layer_noise_ratio', 1.0)
         # public_data_file="public_cifar10_data_iid_5percent/public_train.npz"
         # self.public_data_loader = DataLoader(read_npz_data(file_path=public_data_file), self.batch_size,
         #                               drop_last=True, shuffle=False)
@@ -206,6 +218,53 @@ class clientCP:
         self.save_item(self.pm_test, 'pm_test' + '_' + tag, item_path)
         for idx, it in enumerate(items):
             self.save_item(it, 'item_' + str(idx) + '_' + tag, item_path)
+
+    def select_layers_for_noise(self, param_names):
+        """
+        根据layer_noise_mode选择需要加噪的层
+
+        Args:
+            param_names: 所有参数名列表
+
+        Returns:
+            selected_params: 需要加噪的参数名集合
+        """
+        if self.layer_noise_mode == 'global':
+            # 全局加噪：所有参数
+            return set(param_names)
+
+        elif self.layer_noise_mode == 'feature_only':
+            # 只对特征提取层（conv层）加噪
+            return {name for name in param_names if 'conv' in name}
+
+        elif self.layer_noise_mode == 'classifier_only':
+            # 只对分类层（最后的fc层）加噪
+            # 对于FedAvgCNN，最后的fc层是 'fc.weight' 和 'fc.bias'
+            return {name for name in param_names if name.startswith('fc.') and not name.startswith('fc1.')}
+
+        elif self.layer_noise_mode == 'conv_only':
+            # 只对卷积层加噪
+            return {name for name in param_names if 'conv' in name}
+
+        elif self.layer_noise_mode == 'fc_only':
+            # 只对全连接层加噪
+            return {name for name in param_names if 'fc' in name}
+
+        elif self.layer_noise_mode == 'front_half':
+            # 前半部分层加噪
+            sorted_names = sorted(param_names)
+            n_select = int(len(sorted_names) * self.layer_noise_ratio)
+            return set(sorted_names[:n_select])
+
+        elif self.layer_noise_mode == 'back_half':
+            # 后半部分层加噪
+            sorted_names = sorted(param_names)
+            n_select = int(len(sorted_names) * self.layer_noise_ratio)
+            return set(sorted_names[-n_select:])
+
+        else:  # 'threshold' 或其他
+            # 默认：使用原threshold机制
+            return set(param_names)
 
     def train_metrics(self):
         """计算训练集上的准确率"""
@@ -430,9 +489,9 @@ class clientCP:
                     self.param_diff_test[name] = -self.learning_rate * grad
 
         # Clip and add noise for DP if enabled
-        clip_value=0.005
-        epsilon = 0.8
-        delta = 1e-5
+        clip_value = self.clip_value
+        epsilon = self.epsilon
+        delta = self.delta
 
         if self.dp:
             param_diff = {}
@@ -472,17 +531,42 @@ class clientCP:
                     full_name = f"{module_name}.{name}".lstrip('.')
 
                     param_public_diff[full_name] = (param - self.inital_pra_dp[full_name]).detach()
+            # 根据layer_noise_mode选择需要加噪的层
+            selected_layers = self.select_layers_for_noise(param_diff.keys())
+
+            # 统计加噪参数数量（只在第一轮时打印）
+            if self.round == 1:
+                total_params = sum(diff.numel() for diff in param_diff.values())
+                selected_params = sum(param_diff[name].numel() for name in selected_layers if name in param_diff)
+                print(f"[Client {self.id}] Layer Noise Mode: {self.layer_noise_mode}")
+                print(f"[Client {self.id}] Selected layers: {sorted(selected_layers)}")
+                print(f"[Client {self.id}] Noise coverage: {selected_params}/{total_params} ({100*selected_params/total_params:.2f}%)")
+
             for full_name, diff in param_diff.items():
                 # 这两个：
                 norm_train = torch.norm(diff.abs())
                 norm_test = torch.norm(self.param_diff_test[ full_name].abs())
-                # 1) 计算 25% 分位数作为裁剪阈值
-                threshold_1 = torch.quantile(diff.abs().view(-1), 0.6)
-                threshold_2 = torch.quantile(diff.abs().view(-1), 0.4)
-                # threshold_test= torch.quantile(self.param_diff_test["feature_extractor."+full_name].abs().view(-1), 0.5)
-                # mask = (diff.abs() <= threshold) & (self.param_diff_test["feature_extractor." + full_name].abs() >= threshold_test)
-                # 旧 mask = (diff.abs() <= threshold)
-                core_mask = torch.logical_or((diff.abs() >= threshold_1) , (diff.abs() <= threshold_2))
+
+                # 判断当前层是否需要加噪
+                layer_should_noise = full_name in selected_layers
+
+                # 判断使用哪种加噪策略
+                if not layer_should_noise:
+                    # 当前层不在选中的层中，不加噪
+                    core_mask = torch.zeros_like(diff, dtype=torch.bool)
+                elif self.global_noise or self.layer_noise_mode == 'global':
+                    # 全局加噪：对所有选中层的所有参数添加噪声
+                    core_mask = torch.ones_like(diff, dtype=torch.bool)
+                else:
+                    # 原始的threshold-based选择性加噪（在选中的层内）
+                    # 使用可配置的阈值参数
+                    threshold_1 = torch.quantile(diff.abs().view(-1), self.threshold_high)
+                    threshold_2 = torch.quantile(diff.abs().view(-1), self.threshold_low)
+                    # threshold_test= torch.quantile(self.param_diff_test["feature_extractor."+full_name].abs().view(-1), 0.5)
+                    # mask = (diff.abs() <= threshold) & (self.param_diff_test["feature_extractor." + full_name].abs() >= threshold_test)
+                    # 旧 mask = (diff.abs() <= threshold)
+                    core_mask = torch.logical_or((diff.abs() >= threshold_1) , (diff.abs() <= threshold_2))
+
                 q = torch.quantile(param_public_diff[full_name].abs().view(-1), 0.5)
                 #
                 # # 放大函数：保证输入 ≥ ε，然后统一平方
@@ -502,7 +586,7 @@ class clientCP:
                     f.write(f"Round {self.round}: clip_value = {clip_value}\n "  )
 
                 # ---------------- 新增 ------------
-                if full_name in self.hess_mask:  # 只有 feature_extractor.* 可有 mask
+                if not self.global_noise and full_name in self.hess_mask:  # 只有 feature_extractor.* 可有 mask
                     core_mask &= self.hess_mask[full_name]  # 二阶低曲率 & 一阶低幅度
 
                     # 统计总元素数 & 被选中数

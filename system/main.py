@@ -12,15 +12,6 @@ from flcore.trainmodel.models import *
 
 from utils.mem_utils import MemReporter
 
-# RL-DP imports (optional, only loaded when needed)
-try:
-    from flcore.servers.servercp_rl import FedCP_RL
-    from utils.rl_config import get_rl_dp_config
-    RL_AVAILABLE = True
-    print("[Main] RL-DP system available")
-except ImportError as e:
-    RL_AVAILABLE = False
-    print(f"[Main] RL-DP system not available: {e}")
 
 warnings.simplefilter("ignore")
 torch.manual_seed(0)
@@ -67,26 +58,11 @@ def run(args):
             args.model.fc = nn.Identity()
             args.model = LocalModel(args.model, args.head)
 
-            # 检查是否启用RL-DP系统
-            use_rl = getattr(args, 'enable_rl_dp', False) and args.difference_privacy and RL_AVAILABLE
-
-            if use_rl:
-                # 配置RL参数
-                rl_config = get_rl_dp_config()
-                rl_config.update_from_args(args)
-
-                server = FedCP_RL(args, i)
-                print(f"[Main] Using RL-enhanced FedCP (RL starts from round {getattr(args, 'rl_min_rounds', 100)})")
-
-                # 打印RL配置摘要
-                print(f"[Main] RL Config: lr={rl_config.rl_learning_rate}, epsilon={rl_config.rl_epsilon}")
-                print(f"[Main] Action space: {len(rl_config.action_space)} discrete actions")
+            server = FedCP(args, i)
+            if not args.difference_privacy:
+                print("[Main] Using standard FedCP (no DP)")
             else:
-                server = FedCP(args, i)
-                if not args.difference_privacy:
-                    print("[Main] Using standard FedCP (no DP)")
-                else:
-                    print("[Main] Using standard FedCP with fixed DP thresholds")
+                print("[Main] Using FedCP with differential privacy")
         else:
             raise NotImplementedError
             
@@ -108,7 +84,8 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     # general
-    parser.add_argument('-dp', '--difference_privacy', type=bool, default=False)
+    parser.add_argument('-dp', '--difference_privacy', action='store_true',
+                        help="Enable differential privacy")
     parser.add_argument('-dpn', '--difference_privacy_number', type=float, default=5)
     parser.add_argument('-dpl', '--difference_privacy_layer', type=str, default="model.head")
     parser.add_argument('-dev', "--device", type=str, default="cuda",
@@ -125,7 +102,7 @@ if __name__ == "__main__":
     parser.add_argument('-algo', "--algorithm", type=str, default="FedGP")
     parser.add_argument('-jr', "--join_ratio", type=float, default=1.0,
                         help="Ratio of clients per round")
-    parser.add_argument('-rjr', "--random_join_ratio", type=bool, default=False,
+    parser.add_argument('-rjr', "--random_join_ratio", action='store_true',
                         help="Random ratio of clients per round")
     parser.add_argument('-nc', "--num_clients", type=int, default=20,
                         help="Total number of clients")
@@ -137,20 +114,30 @@ if __name__ == "__main__":
                         help="Rounds gap for evaluation")
     parser.add_argument('-al', "--alpha", type=float, default=1)
     parser.add_argument('-lam', "--lamda", type=float, default=0.0)
-    parser.add_argument('-mia', "--enable_mia", type=bool, default=False,
+    parser.add_argument('-mia', "--enable_mia", action='store_true',
                         help="Enable MIA evaluation during training")
 
-    # RL-DP parameters (only used if RL is available and enabled)
-    parser.add_argument('--enable_rl_dp', type=bool, default=False,
-                        help="Enable RL-based adaptive differential privacy (requires DP enabled)")
-    parser.add_argument('--rl_min_rounds', type=int, default=100,
-                        help="Minimum rounds before enabling RL (default: 100)")
-    parser.add_argument('--rl_learning_rate', type=float, default=0.01,
-                        help="Learning rate for RL agent")
-    parser.add_argument('--rl_epsilon', type=float, default=0.1,
-                        help="Initial exploration rate for RL agent")
-    parser.add_argument('--rl_update_interval', type=int, default=10,
-                        help="Interval for RL policy updates (in rounds)")
+    # DP阈值参数
+    parser.add_argument('--threshold_high', type=float, default=0.6,
+                        help="High threshold percentile for noise mask (default: 0.6)")
+    parser.add_argument('--threshold_low', type=float, default=0.4,
+                        help="Low threshold percentile for noise mask (default: 0.4)")
+    parser.add_argument('--clip_value', type=float, default=0.005,
+                        help="Gradient clipping value for DP (default: 0.005)")
+    parser.add_argument('--epsilon', type=float, default=0.8,
+                        help="Privacy budget epsilon for DP (default: 0.8)")
+    parser.add_argument('--delta', type=float, default=1e-5,
+                        help="Privacy parameter delta for DP (default: 1e-5)")
+    parser.add_argument('--global_noise', action='store_true',
+                        help="Apply noise to all parameters globally (no threshold-based selection)")
+
+    # Layer-wise noise selection parameters
+    parser.add_argument('--layer_noise_mode', type=str, default='threshold',
+                        choices=['threshold', 'global', 'feature_only', 'classifier_only',
+                                'front_half', 'back_half', 'conv_only', 'fc_only'],
+                        help="Layer selection mode for noise addition")
+    parser.add_argument('--layer_noise_ratio', type=float, default=1.0,
+                        help="Ratio of layers to apply noise (for front_half/back_half modes)")
 
     args = parser.parse_args()
     
@@ -158,20 +145,6 @@ if __name__ == "__main__":
     print("dp", args.difference_privacy)
     print("MIA evaluation enabled:", args.enable_mia)
 
-    # 打印RL-DP状态
-    if getattr(args, 'enable_rl_dp', False):
-        if not RL_AVAILABLE:
-            print("WARNING: RL-DP requested but not available. Using standard DP.")
-        elif not args.difference_privacy:
-            print("WARNING: RL-DP requires differential privacy to be enabled.")
-        else:
-            print("RL-DP system enabled!")
-            print(f"RL will start from round {args.rl_min_rounds}")
-            print(f"RL learning rate: {args.rl_learning_rate}")
-            print(f"RL exploration rate: {args.rl_epsilon}")
-    else:
-        print("RL-DP system disabled (using standard approach)")
-    
     os.environ["CUDA_VISIBLE_DEVICES"] = args.device_id
     print("dp_number",args.difference_privacy_number)
     # torch.cuda.set_device(int(args.device_id))
