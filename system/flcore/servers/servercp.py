@@ -148,6 +148,42 @@ class FedCP:
                 self.mia_evaluator = None
                 self.enable_mia = False
 
+        # Initialize GIA (Gradient Inversion Attack) evaluator
+        self.gia_evaluator = None
+        self.enable_gia = getattr(args, 'enable_gia', False)
+        self.gia_results_history = []
+
+        if self.enable_gia:
+            try:
+                print(f"[Server] Initializing GIA evaluator...")
+                from Gradient_Inversion_Attack.gia_evaluator import FederatedGIAEvaluator
+                from Gradient_Inversion_Attack.utils.config import create_config_from_args
+
+                # Create GIA config from args
+                gia_config = create_config_from_args(args)
+
+                # Initialize GIA evaluator
+                self.gia_evaluator = FederatedGIAEvaluator(
+                    stylegan_model_path=args.gia_stylegan_path,
+                    device=args.device,
+                    config=gia_config,
+                    results_dir=f'gia_results/{args.dataset}_alpha{args.alpha}'
+                )
+                print(f"[Server] GIA evaluator initialized successfully")
+                print(f"[Server] GIA will evaluate after training completes")
+            except ImportError as e:
+                print(f"[Server] GIA Import Error: {e}")
+                print(f"[Server] Continuing without GIA evaluation...")
+                self.gia_evaluator = None
+                self.enable_gia = False
+            except Exception as e:
+                print(f"[Server] Warning: Could not initialize GIA evaluator: {e}")
+                print(f"[Server] Error type: {type(e).__name__}")
+                import traceback
+                traceback.print_exc()
+                self.gia_evaluator = None
+                self.enable_gia = False
+
 
     def select_clients(self):
         if self.random_join_ratio:
@@ -304,12 +340,15 @@ class FedCP:
                     # Log MIA results alongside accuracy
                     if mia_results['status'] == 'success' and 'summary' in mia_results:
                         summary = mia_results['summary']
+                        avg_model_acc = summary.get('avg_model_accuracy', 0.0)
                         with open(file_path, "a") as f:
                             f.write(f"    MIA Round {i} - Avg F-score: {summary['avg_f_score']:.4f}, "
+                                   f"Avg Model Acc: {avg_model_acc:.4f}, "
                                    f"Avg TPR: {summary['avg_tpr']:.4f}, Avg FPR: {summary['avg_fpr']:.4f}, "
                                    f"High Risk Clients: {summary['high_risk_clients']}/{summary['total_clients']}\n")
 
                         print(f"[Server] MIA Results - Avg F-score: {summary['avg_f_score']:.4f}, "
+                              f"Avg Model Accuracy: {avg_model_acc:.4f}, "
                               f"High Risk: {summary['high_risk_clients']}/{summary['total_clients']} clients")
 
                         # 如果使用RL客户端，更新MIA分数以供RL学习
@@ -410,6 +449,50 @@ class FedCP:
                 print("No successful MIA evaluations recorded.")
 
             print("============================================\n")
+
+        # Run GIA evaluation after training completes
+        if self.enable_gia and self.gia_evaluator:
+            print("\n========== GIA (Gradient Inversion Attack) Evaluation ==========")
+            try:
+                print(f"[Server] Running GIA evaluation on all clients...")
+
+                # Run GIA evaluation
+                gia_results = self.gia_evaluator.evaluate_all_clients(
+                    clients=self.clients,
+                    round_num=self.global_rounds,
+                    dataset_name=args.dataset,
+                    save_results=True
+                )
+
+                self.gia_results_history.append(gia_results)
+
+                # Print summary
+                if gia_results.get('summary'):
+                    summary = gia_results['summary']
+                    print(f"\n[GIA] Evaluation complete!")
+                    print(f"[GIA] Successful evaluations: {summary.get('successful_clients', 0)}/{summary.get('num_clients', 0)} clients")
+                    if summary.get('avg_psnr'):
+                        print(f"[GIA] Average PSNR: {summary['avg_psnr']:.2f} dB")
+                        print(f"[GIA] PSNR range: [{summary['min_psnr']:.2f}, {summary['max_psnr']:.2f}] dB")
+                    print(f"[GIA] High quality reconstructions: {summary.get('high_quality_reconstructions', 0)} clients")
+                    print(f"[GIA] Medium quality reconstructions: {summary.get('medium_quality_reconstructions', 0)} clients")
+                    print(f"[GIA] Low quality reconstructions: {summary.get('low_quality_reconstructions', 0)} clients")
+
+                # Test defense mechanisms if requested
+                if hasattr(args, 'gia_test_defense') and args.gia_test_defense:
+                    print(f"\n[GIA] Testing defense mechanisms...")
+                    defense_results = self.gia_evaluator.test_defense_mechanisms(
+                        client=self.clients[0],  # Test on first client
+                        num_samples=3
+                    )
+                    print(f"[GIA] Defense test complete. Results saved.")
+
+            except Exception as e:
+                print(f"[Server] GIA evaluation error: {e}")
+                import traceback
+                traceback.print_exc()
+
+            print("================================================================\n")
 
 
     def receive_models(self):

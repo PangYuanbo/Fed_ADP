@@ -117,6 +117,23 @@ if __name__ == "__main__":
     parser.add_argument('-mia', "--enable_mia", action='store_true',
                         help="Enable MIA evaluation during training")
 
+    # GIA (Gradient Inversion Attack) parameters
+    parser.add_argument('-gia', "--enable_gia", action='store_true',
+                        help="Enable GIA evaluation after training")
+    parser.add_argument('--gia_stylegan_path', type=str,
+                        default='Gradient_Inversion_Attack/pretrained_models/stylegan_xl_cifar10.pkl',
+                        help="Path to StyleGAN-XL pretrained model")
+    parser.add_argument('--gia_num_samples', type=int, default=5,
+                        help="Number of samples to reconstruct per client (GIA)")
+    parser.add_argument('--gia_iterations', type=int, default=10000,
+                        help="Number of optimization iterations for GIA")
+    parser.add_argument('--gia_lr', type=float, default=0.01,
+                        help="Learning rate for GIA latent optimization")
+    parser.add_argument('--gia_save_visuals', action='store_true', default=True,
+                        help="Save GIA visualization results")
+    parser.add_argument('--gia_test_defense', action='store_true',
+                        help="Test defense mechanisms against GIA")
+
     # DP阈值参数
     parser.add_argument('--threshold_high', type=float, default=0.6,
                         help="High threshold percentile for noise mask (default: 0.6)")
@@ -138,6 +155,10 @@ if __name__ == "__main__":
                         help="Layer selection mode for noise addition")
     parser.add_argument('--layer_noise_ratio', type=float, default=1.0,
                         help="Ratio of layers to apply noise (for front_half/back_half modes)")
+
+    # Hessian computation parameters
+    parser.add_argument('--hessian_compute_interval', type=int, default=5,
+                        help="Compute Hessian (second-order gradient) every N rounds (default: 5)")
 
     args = parser.parse_args()
     

@@ -44,23 +44,49 @@ class clientCP:
         # Layer-wise noise selection parameters
         self.layer_noise_mode = getattr(args, 'layer_noise_mode', 'threshold')
         self.layer_noise_ratio = getattr(args, 'layer_noise_ratio', 1.0)
+
+        # Hessian computation interval
+        self.hessian_compute_interval = getattr(args, 'hessian_compute_interval', 5)
         # public_data_file="public_cifar10_data_iid_5percent/public_train.npz"
         # self.public_data_loader = DataLoader(read_npz_data(file_path=public_data_file), self.batch_size,
         #                               drop_last=True, shuffle=False)
         log_root = "logs"
         self.param_diff = {}
         self.inital_pra = {}
+
+        # 生成唯一的运行标识符（时间戳）
+        import time
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+
+        # 构建细粒度的日志子目录名
+        log_tags = []
+        log_tags.append(f"{args.dataset}")
         if self.dp:
-            sub =f"{self.dataset}_gradient_log_dp"
+            log_tags.append("dp")
+            log_tags.append(f"eps{args.epsilon:.2f}")
         else:
-            sub = f"{self.dataset}_gradient_log"
+            log_tags.append("nodp")
+
+        # 判断是否使用选择性上传
+        enable_selective = getattr(args, 'enable_selective_upload', False)
+        if enable_selective:
+            log_tags.append("selective")
+            gradient_keep_ratio = getattr(args, 'gradient_keep_ratio', 0.3)
+            log_tags.append(f"keep{gradient_keep_ratio:.2f}")
+            noise_mult = getattr(args, 'noise_multiplier', 1.0)
+            log_tags.append(f"noise{noise_mult:.1f}")
+
+        log_tags.append(f"gr{args.global_rounds}")
+        log_tags.append(timestamp)
+
+        sub = "_".join(log_tags)
         result_dir = os.path.join(log_root, sub)
-        if os.path.exists(result_dir):
-            shutil.rmtree(result_dir, ignore_errors=True)
         os.makedirs(result_dir, exist_ok=True)
-        filename = f"gradient_log_client{self.id}_{args.dataset}_{args.global_rounds}_{args.local_learning_rate:.4f}.txt"
+
+        filename = f"client{self.id}_lr{args.local_learning_rate:.4f}.txt"
 
         self.filepath = os.path.join(result_dir, filename)
+        # 创建所有需要的日志文件
         with open(self.filepath + "testbefore", "a") as f:
             pass
         with open(self.filepath + "test", "a") as f:
@@ -68,6 +94,8 @@ class clientCP:
         with open(self.filepath + "before", "a") as f:
             pass
         with open(self.filepath + "after", "a") as f:
+            pass
+        with open(self.filepath + "train_before", "a") as f:
             pass
         self.lamda = args.lamda
 
@@ -432,8 +460,8 @@ class clientCP:
                     break
             # …已有代码：loss.backward(); break
             # ------------- 新增  -------------
-            # 只在每 10 轮估计一次二阶信息，避免过慢
-            if self.round % 10 == 0:
+            # 只在每 N 轮估计一次二阶信息，避免过慢
+            if self.round % self.hessian_compute_interval == 0:
                 # 使用同一个 batch 的 loss，反向图已在内存
                 diag_H = hessian_diag_hutchinson(self.model, loss, num_samples=8)
 

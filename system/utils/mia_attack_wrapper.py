@@ -262,6 +262,7 @@ class FederatedMIAEvaluator:
             label_stats = {
                 'sum_f_score': 0.0, 'sum_f_score_sq': 0.0,
                 'sum_tpr': 0.0, 'sum_fpr': 0.0, 'sum_accuracy': 0.0,
+                'sum_model_accuracy': 0.0,  # 🔑 NEW: 累加模型在各label上的准确率
                 'max_f_score': -float('inf'), 'min_f_score': float('inf'),
                 'labels_evaluated': 0
             }
@@ -274,16 +275,19 @@ class FederatedMIAEvaluator:
                 if label_result['status'] == 'success':
                     # 🔑 只提取关键指标，不保存完整结果
                     f_score = label_result['f_score']
+                    model_acc = label_result.get('model_accuracy', 0.0)  # 🔑 NEW: 获取模型准确率
                     label_stats['sum_f_score'] += f_score
                     label_stats['sum_f_score_sq'] += f_score ** 2
                     label_stats['sum_tpr'] += label_result['tpr']
                     label_stats['sum_fpr'] += label_result['fpr']
                     label_stats['sum_accuracy'] += label_result['accuracy']
+                    label_stats['sum_model_accuracy'] += model_acc  # 🔑 NEW: 累加模型准确率
                     label_stats['max_f_score'] = max(label_stats['max_f_score'], f_score)
                     label_stats['min_f_score'] = min(label_stats['min_f_score'], f_score)
                     label_stats['labels_evaluated'] += 1
 
-                    print(f"[MIA Wrapper]   Label {label} F-score: {f_score:.4f}")
+                    # 🔑 NEW: 同时打印F-score和模型在该label上的准确率
+                    print(f"[MIA Wrapper]   Label {label} | F-score: {f_score:.4f} | Model Acc on this label: {model_acc:.4f}")
 
                 # 🔑 立即删除label结果，强制清理
                 del label_result
@@ -303,6 +307,7 @@ class FederatedMIAEvaluator:
                     'avg_tpr': label_stats['sum_tpr'] / n,
                     'avg_fpr': label_stats['sum_fpr'] / n,
                     'avg_accuracy': label_stats['sum_accuracy'] / n,
+                    'avg_model_accuracy': label_stats['sum_model_accuracy'] / n,  # 🔑 NEW: 平均模型准确率
                     'max_f_score': label_stats['max_f_score'],
                     'min_f_score': label_stats['min_f_score'],
                     'labels_evaluated': n,
@@ -415,6 +420,10 @@ class FederatedMIAEvaluator:
             all_pred_scores = []
             all_true_labels = []
 
+            # 🔑 NEW: 计算原始模型在该label上的分类准确率
+            model_correct_count = 0
+            model_total_count = 0
+
             # 处理训练数据 (member = 1)
             for batch_outputs, batch_labels, batch_head_grads, batch_feat_grads in \
                     get_model_outputs_labels_and_grads_gpu(client_model, train_loader, self.device):
@@ -432,6 +441,11 @@ class FederatedMIAEvaluator:
                     # 只保存预测分数，不保存梯度
                     all_pred_scores.append(batch_scores.detach())
                     all_true_labels.append(torch.ones(len(batch_scores), device=self.device))
+
+                    # 🔑 NEW: 计算原始模型的分类准确率
+                    model_predictions = torch.argmax(batch_outputs, dim=1)
+                    model_correct_count += (model_predictions == batch_labels).sum().item()
+                    model_total_count += len(batch_labels)
 
                 # 🔑 立即清理当前batch
                 del batch_outputs, batch_labels, batch_head_grads, batch_feat_grads
@@ -455,6 +469,11 @@ class FederatedMIAEvaluator:
                     all_pred_scores.append(batch_scores.detach())
                     all_true_labels.append(torch.zeros(len(batch_scores), device=self.device))
 
+                    # 🔑 NEW: 计算原始模型的分类准确率（测试集）
+                    model_predictions = torch.argmax(batch_outputs, dim=1)
+                    model_correct_count += (model_predictions == batch_labels).sum().item()
+                    model_total_count += len(batch_labels)
+
                 # 🔑 立即清理当前batch
                 del batch_outputs, batch_labels, batch_head_grads, batch_feat_grads
                 del batch_inputs, batch_preds, batch_scores
@@ -475,6 +494,9 @@ class FederatedMIAEvaluator:
 
             # 计算指标（GPU上计算）
             metrics = self._calculate_metrics(pred_scores, true_labels, use_gpu=True, label=target_label)
+
+            # 🔑 NEW: 计算原始模型在该label上的分类准确率
+            model_accuracy = model_correct_count / model_total_count if model_total_count > 0 else 0.0
 
             # 清理最终变量
             del pred_scores, true_labels
@@ -499,6 +521,7 @@ class FederatedMIAEvaluator:
                 'label': target_label,
                 'train_samples': metrics.get('tp', 0) + metrics.get('fn', 0),
                 'test_samples': metrics.get('tn', 0) + metrics.get('fp', 0),
+                'model_accuracy': model_accuracy,  # 🔑 NEW: 添加模型分类准确率
                 **metrics
             }
 
