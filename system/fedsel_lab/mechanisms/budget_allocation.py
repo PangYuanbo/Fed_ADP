@@ -26,7 +26,12 @@ class BudgetAllocator:
         delta (float): Privacy parameter for (ε, δ)-DP
     """
 
-    def __init__(self, epsilon_total: float, delta: float = 1e-6):
+    def __init__(
+        self,
+        epsilon_total: float,
+        delta: float = 1e-6,
+        allocation_ratio: float = None
+    ):
         """
         Initialize budget allocator.
 
@@ -41,6 +46,11 @@ class BudgetAllocator:
 
         self.epsilon_total = epsilon_total
         self.delta = delta
+        if allocation_ratio is not None and not (0 < allocation_ratio < 1):
+            raise ValueError(
+                f"Allocation ratio must be in (0, 1), got {allocation_ratio}"
+            )
+        self.allocation_ratio = allocation_ratio
 
     def allocate(self, d: int, k: int, mechanism: str = 'PE') -> Tuple[float, float]:
         """
@@ -64,15 +74,18 @@ class BudgetAllocator:
         if d <= 0:
             raise ValueError(f"d must be positive, got {d}")
 
-        # Compute allocation ratio based on mechanism
-        if mechanism == 'PE':
-            ratio = self._compute_pe_ratio(d, k)
-        elif mechanism == 'EXP':
-            ratio = self._compute_exp_ratio(d, k)
-        elif mechanism == 'PS':
-            ratio = self._compute_ps_ratio(d, k)
+        # Compute allocation ratio based on mechanism (or manual µ)
+        if self.allocation_ratio is not None:
+            ratio = self.allocation_ratio
         else:
-            raise ValueError(f"Unknown mechanism: {mechanism}. Use 'PE', 'EXP', or 'PS'")
+            if mechanism == 'PE':
+                ratio = self._compute_pe_ratio(d, k)
+            elif mechanism == 'EXP':
+                ratio = self._compute_exp_ratio(d, k)
+            elif mechanism == 'PS':
+                ratio = self._compute_ps_ratio(d, k)
+            else:
+                raise ValueError(f"Unknown mechanism: {mechanism}. Use 'PE', 'EXP', or 'PS'")
 
         # Allocate budget
         epsilon_1 = ratio * self.epsilon_total

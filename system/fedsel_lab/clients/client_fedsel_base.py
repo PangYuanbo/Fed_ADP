@@ -56,7 +56,10 @@ class ClientFedSelBase(clientCP):
         # FedSel-specific parameters
         self.fedsel_beta = getattr(args, 'fedsel_beta', 0.9)
         self.fedsel_k = getattr(args, 'fedsel_k', 100)
-        self.fedsel_mechanism = getattr(args, 'fedsel_mechanism', 'PE')
+        self.fedsel_mechanism = getattr(args, 'fedsel_mechanism', 'PE').upper()
+        self.fedsel_mu = getattr(args, 'fedsel_mu', None)
+        if self.fedsel_mu is not None and not (0 < self.fedsel_mu < 1):
+            raise ValueError(f"fedsel_mu must be in (0, 1), got {self.fedsel_mu}")
 
         # Initialize gradient accumulator
         self.grad_accumulator = GradientAccumulator(self.model, beta=self.fedsel_beta)
@@ -64,7 +67,8 @@ class ClientFedSelBase(clientCP):
         # Initialize budget allocator
         self.budget_allocator = BudgetAllocator(
             epsilon_total=self.epsilon if self.dp else 1.0,
-            delta=self.delta
+            delta=self.delta,
+            allocation_ratio=self.fedsel_mu
         )
 
         # Logging
@@ -73,6 +77,8 @@ class ClientFedSelBase(clientCP):
             print(f"  Mechanism: {self.fedsel_mechanism}")
             print(f"  Top-k: {self.fedsel_k}")
             print(f"  Beta (accumulation): {self.fedsel_beta}")
+            if self.fedsel_mu is not None:
+                print(f"  Manual µ (budget split): {self.fedsel_mu:.3f}")
             print(f"  DP enabled: {self.dp}")
             if self.dp:
                 print(f"  Epsilon: {self.epsilon}, Delta: {self.delta}")

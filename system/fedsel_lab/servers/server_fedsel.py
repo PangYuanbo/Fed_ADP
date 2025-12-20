@@ -26,6 +26,8 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 from flcore.servers.servercp import FedCP
 from utils.data_utils import read_client_data
 from fedsel_lab.clients.client_fedsel_pe import ClientFedSelPE
+from fedsel_lab.clients.client_fedsel_exp import ClientFedSelEXP
+from fedsel_lab.clients.client_fedsel_ps import ClientFedSelPS
 
 
 class ServerFedSel(FedCP):
@@ -69,7 +71,7 @@ class ServerFedSel(FedCP):
         self.eval_gap = args.eval_gap
 
         # FedSel-specific parameters
-        self.fedsel_mechanism = getattr(args, 'fedsel_mechanism', 'PE')
+        self.fedsel_mechanism = getattr(args, 'fedsel_mechanism', 'PE').upper()
         self.fedsel_k = getattr(args, 'fedsel_k', 100)
         self.fedsel_beta = getattr(args, 'fedsel_beta', 0.9)
 
@@ -92,6 +94,19 @@ class ServerFedSel(FedCP):
         print(f"Global rounds: {self.global_rounds}")
         print(f"{'='*60}\n")
 
+        # Resolve client class per mechanism
+        client_cls_map = {
+            'PE': ClientFedSelPE,
+            'EXP': ClientFedSelEXP,
+            'PS': ClientFedSelPS
+        }
+        if self.fedsel_mechanism not in client_cls_map:
+            raise ValueError(
+                f"Unsupported FedSel mechanism '{self.fedsel_mechanism}'. "
+                f"Available: {', '.join(client_cls_map.keys())}"
+            )
+        client_cls = client_cls_map[self.fedsel_mechanism]
+
         # Create FedSel clients
         print(f"Creating {self.num_clients} FedSel-{self.fedsel_mechanism} clients...")
 
@@ -99,8 +114,8 @@ class ServerFedSel(FedCP):
             train_data = read_client_data(self.dataset, i, is_train=True, alpha=self.alpha)
             test_data = read_client_data(self.dataset, i, is_train=False, alpha=self.alpha)
 
-            # Create FedSel-PE client
-            client = ClientFedSelPE(
+            # Create FedSel client for configured mechanism
+            client = client_cls(
                 args,
                 id=i,
                 train_samples=len(train_data),

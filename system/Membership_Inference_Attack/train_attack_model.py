@@ -4,9 +4,9 @@
 
 import torch
 from torch.utils.data import DataLoader, TensorDataset, Subset
-from .model import GradientMIA
-from .mia_attack_utils import get_model_outputs_labels_and_grads, prepare_attack_model_inputs
-from .data_utils import read_client_data, filter_by_label
+from utils.mia_attack_model import GradientMIA
+from mia_attack_utils import get_model_outputs_labels_and_grads, prepare_attack_model_inputs
+from data_utils import read_client_data, filter_by_label
 
 
 def train_attack_model(shadow_model, shadow_client_files, target_label, batch_size, device, epochs, lr, num_clients,alpha):

@@ -1,7 +1,7 @@
 import torch
 
 from torch.utils.data import DataLoader, TensorDataset, Subset, ConcatDataset
-from .data_utils import read_client_data, filter_by_label
+from data_utils import read_client_data, filter_by_label
 
 def evaluate_all_clients_accuracy(client_model_files, get_model_fn, device, batch_size, alpha, num_clients):
     """
