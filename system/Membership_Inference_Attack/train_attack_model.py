@@ -2,15 +2,38 @@
 # train_attack_model.py
 # ============================
 
+import os
+import gc
 import torch
-from torch.utils.data import DataLoader, TensorDataset, Subset
+from torch.utils.data import DataLoader, TensorDataset
 from utils.mia_attack_model import GradientMIA
+from utils.attack_feature_config import (
+    attack_checkpoint_name,
+    normalize_attack_features,
+)
 from mia_attack_utils import get_model_outputs_labels_and_grads, prepare_attack_model_inputs
 from data_utils import read_client_data, filter_by_label
 
 
-def train_attack_model(shadow_model, shadow_client_files, target_label, batch_size, device, epochs, lr, num_clients,alpha):
-    attack_model = GradientMIA().to(device)
+def train_attack_model(shadow_model,
+                       shadow_client_files,
+                       target_label,
+                       batch_size,
+                       device,
+                       epochs,
+                       lr,
+                       num_clients,
+                       alpha,
+                       attack_features=None,
+                       checkpoint_dir=".",
+                       num_classes=None):
+    enabled_features = normalize_attack_features(attack_features)
+    if num_classes is None:
+        num_classes = getattr(getattr(shadow_model, 'head', None), 'out_features', 10)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    primary_checkpoint = os.path.join(checkpoint_dir, attack_checkpoint_name(target_label, enabled_features))
+    legacy_checkpoint = os.path.join(checkpoint_dir, attack_checkpoint_name(target_label, enabled_features, include_suffix=False))
+    attack_model = GradientMIA(enabled_features=enabled_features, num_classes=num_classes).to(device)
     optimizer = torch.optim.Adam(attack_model.parameters(), lr=lr)
     loss_fn = torch.nn.BCEWithLogitsLoss()
 
@@ -47,9 +70,15 @@ def train_attack_model(shadow_model, shadow_client_files, target_label, batch_si
         print(f"\n[INFO] Combined holdout dataset size: {len(combined_holdout_dataset)}")
     else:
         print(f"[SKIP] No holdout data for label {target_label}")
+        feature_storage = None
+        y_inout = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
         return
 
-    X_grad_conv1, X_grad_conv2, X_grad_fc1, X_grad_fc, X_softmax, y_inout = [], [], [], [], [], []
+    feature_storage = {name: [] for name in enabled_features}
+    y_inout = []
 
     # 遍历每个客户端模型，使用其训练数据(label=1) + 共享的holdout数据(label=0)
     for client_idx, (model_file, train_loader) in enumerate(zip(shadow_client_files[:len(shadow_train_loaders)], shadow_train_loaders)):
@@ -63,55 +92,63 @@ def train_attack_model(shadow_model, shadow_client_files, target_label, batch_si
 
         # 1. 处理该客户端的训练数据 (成员数据, label=1)
         outputs, labels, head_grads, feat_grads = get_model_outputs_labels_and_grads(shadow_model, train_loader, device)
-        g1, g2, g3, g4, softmax = prepare_attack_model_inputs(outputs, head_grads, feat_grads)
-        X_grad_conv1.append(g1)
-        X_grad_conv2.append(g2)
-        X_grad_fc1.append(g3)
-        X_grad_fc.append(g4)
-        X_softmax.append(softmax)
-        y_inout.append(torch.full((g1.size(0),), 1))  # 成员数据
-        print(f"  Train data: {g1.size(0)} samples (label=1)")
+        member_features = prepare_attack_model_inputs(
+            outputs,
+            head_grads,
+            feat_grads,
+            enabled_features=enabled_features,
+            return_dict=True,
+        )
+        member_count = next(iter(member_features.values())).size(0)
+        for name in enabled_features:
+            feature_storage[name].append(member_features[name])
+        y_inout.append(torch.full((member_count,), 1))
+        print(f"  Train data: {member_count} samples (label=1)")
 
         # 2. 处理共享的holdout数据 (非成员数据, label=0)
         outputs, labels, head_grads, feat_grads = get_model_outputs_labels_and_grads(shadow_model, shared_holdout_loader, device)
-        g1, g2, g3, g4, softmax = prepare_attack_model_inputs(outputs, head_grads, feat_grads)
-        X_grad_conv1.append(g1)
-        X_grad_conv2.append(g2)
-        X_grad_fc1.append(g3)
-        X_grad_fc.append(g4)
-        X_softmax.append(softmax)
-        y_inout.append(torch.full((g1.size(0),), 0))  # 非成员数据
-        print(f"  Holdout data: {g1.size(0)} samples (label=0)")
+        non_member_features = prepare_attack_model_inputs(
+            outputs,
+            head_grads,
+            feat_grads,
+            enabled_features=enabled_features,
+            return_dict=True,
+        )
+        non_member_count = next(iter(non_member_features.values())).size(0)
+        for name in enabled_features:
+            feature_storage[name].append(non_member_features[name])
+        y_inout.append(torch.full((non_member_count,), 0))
+        print(f"  Holdout data: {non_member_count} samples (label=0)")
+        del outputs, labels, head_grads, feat_grads, member_features, non_member_features
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 
-    if len(X_grad_conv1) == 0:
+    if all(len(v) == 0 for v in feature_storage.values()):
         print(f"[SKIP] No data collected for label {target_label}.")
+        feature_storage = None
+        y_inout = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
         return
 
     # 拼接张量
-    X_grad_conv1 = torch.cat(X_grad_conv1, dim=0)
-    X_grad_conv2 = torch.cat(X_grad_conv2, dim=0)
-    X_grad_fc1 = torch.cat(X_grad_fc1, dim=0)
-    X_grad_fc = torch.cat(X_grad_fc, dim=0)
-    X_softmax = torch.cat(X_softmax, dim=0)
+    concatenated_features = [torch.cat(feature_storage[name], dim=0) for name in enabled_features]
     y_inout = torch.cat(y_inout, dim=0)
 
     # 🔍 统一维度检查（debug friendly）
-    lens = [X_grad_conv1.shape[0], X_grad_conv2.shape[0], X_grad_fc1.shape[0],
-            X_grad_fc.shape[0], X_softmax.shape[0], y_inout.shape[0]]
+    lens = [tensor.shape[0] for tensor in concatenated_features] + [y_inout.shape[0]]
 
     if len(set(lens)) != 1:
         print(f"[ERROR] Shape mismatch at label {target_label}:")
-        print(f"  conv1:    {X_grad_conv1.shape}")
-        print(f"  conv2:    {X_grad_conv2.shape}")
-        print(f"  fc1:      {X_grad_fc1.shape}")
-        print(f"  fc:       {X_grad_fc.shape}")
-        print(f"  softmax:  {X_softmax.shape}")
+        for name, tensor in zip(enabled_features, concatenated_features):
+            print(f"  {name}: {tensor.shape}")
         print(f"  y_inout:  {y_inout.shape}")
         return  # ⛔️ 停止该 label 的训练
 
-    dataset = TensorDataset(X_grad_conv1, X_grad_conv2, X_grad_fc1, X_grad_fc, X_softmax, y_inout)
+    dataset = TensorDataset(*concatenated_features, y_inout)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
     print(f"[Training] Attack model for label {target_label}")
@@ -127,10 +164,14 @@ def train_attack_model(shadow_model, shadow_client_files, target_label, batch_si
         total_loss = 0
         tp, fp, tn, fn = 0, 0, 0, 0  # For F-score calculation
 
-        for g1, g2, g3, g4, softmax, labels in loader:
-            g1, g2, g3, g4, softmax = g1.to(device), g2.to(device), g3.to(device), g4.to(device), softmax.to(device)
+        for batch in loader:
+            *feature_batches, labels = batch
+            feature_inputs = {
+                name: tensor.to(device)
+                for name, tensor in zip(enabled_features, feature_batches)
+            }
             labels = labels.float().unsqueeze(1).to(device)
-            preds = attack_model(g1, g2, g3, g4, softmax)
+            preds = attack_model(feature_inputs)
             loss = loss_fn(preds, labels)
             optimizer.zero_grad()
             loss.backward()
@@ -166,7 +207,9 @@ def train_attack_model(shadow_model, shadow_client_files, target_label, batch_si
         if f_score > best_f_score:
             best_f_score = f_score
             best_loss = avg_loss
-            torch.save(attack_model.state_dict(), f"attack_model{target_label}.pth")
+            torch.save(attack_model.state_dict(), primary_checkpoint)
+            if legacy_checkpoint != primary_checkpoint:
+                torch.save(attack_model.state_dict(), legacy_checkpoint)
             patience_counter = 0
             print(f"  → Best model saved! (F-score: {best_f_score:.4f})")
         else:
@@ -178,3 +221,7 @@ def train_attack_model(shadow_model, shadow_client_files, target_label, batch_si
             break
 
     print(f"[Final] Best F-score: {best_f_score:.4f}, Best Loss: {best_loss:.4f}")
+    del dataset, loader, concatenated_features, y_inout, feature_storage
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()

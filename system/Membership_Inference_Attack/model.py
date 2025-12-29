@@ -3,6 +3,7 @@ import torch.nn as nn
 
 from torchvision import models
 import torch.nn.functional as F
+from utils.mia_attack_model import GradientMIA as BaseGradientMIA
 batch_size = 16
 
 
@@ -70,6 +71,8 @@ class FedAvgCNN(nn.Module):
             nn.ReLU(inplace=True)
         )
         self.fc = nn.Linear(dim1, num_classes)
+        self._defense_layers = nn.ModuleList()
+        self._defense_installed = False
 
     def forward(self, x):
         if torch.isnan(x).any() or torch.isinf(x).any():
@@ -90,6 +93,46 @@ class FedAvgCNN(nn.Module):
         if torch.isnan(out).any() or torch.isinf(out).any():
             print("NaN/Inf after conv5!")
         return out
+
+    def install_defense_layers(self, kernel_size=3, padding=1, bias=False, init_std=1e-3):
+        if self._defense_installed:
+            return
+
+        def _attach_defense(block, channels):
+            base_layers = list(block.children())
+            conv = base_layers[0]
+            rest = base_layers[1:]
+            defense = nn.Conv2d(channels, channels, kernel_size=kernel_size, padding=padding, bias=bias)
+            nn.init.normal_(defense.weight, mean=0.0, std=init_std)
+            if bias and defense.bias is not None:
+                nn.init.zeros_(defense.bias)
+            defense.to(conv.weight.device)
+            new_block = nn.Sequential(conv, defense, *rest)
+            return new_block, defense
+
+        self.conv1, defense1 = _attach_defense(self.conv1, 32)
+        self.conv2, defense2 = _attach_defense(self.conv2, 64)
+        self._defense_layers = nn.ModuleList([defense1, defense2])
+        self._defense_installed = True
+
+    def defense_parameters(self):
+        if not self._defense_layers:
+            return []
+        params = []
+        for layer in self._defense_layers:
+            params.extend(list(layer.parameters()))
+        return params
+
+    def freeze_base_parameters(self):
+        for name, param in self.named_parameters():
+            param.requires_grad = False
+        for layer in self._defense_layers:
+            for param in layer.parameters():
+                param.requires_grad = True
+
+    def unfreeze_all_parameters(self):
+        for _, param in self.named_parameters():
+            param.requires_grad = True
 
 
 class fastText(nn.Module):
@@ -276,37 +319,8 @@ class ConditionalSelection(nn.Module):
         return x[:, 0, :], x[:, 1, :]
 
 
-class GradientMIA(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-        self.cnn1 = nn.Sequential(
-            nn.Conv2d(1, 64, 3, padding=1), nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1)), nn.Flatten(), nn.Linear(64, 128)
-        )
-
-        self.cnn2 = nn.Sequential(
-            nn.Conv2d(1, 128, 3, padding=1), nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1)), nn.Flatten(), nn.Linear(128, 128)
-        )
-
-
-
-        self.fcn_softmax = nn.Sequential(
-            nn.Linear(10, 32), nn.ReLU(),
-            nn.Linear(32, 64), nn.ReLU()
-        )
-
-        self.classifier = nn.Sequential(
-            nn.Linear(320, 64), nn.ReLU(), nn.Dropout(0.5),
-            nn.Linear(64, 1)  # 移除Sigmoid，因为BCEWithLogitsLoss内部已包含
-        )
-
-    def forward(self, grad_conv1, grad_conv2, grad_fc1, grad_fc, softmax_out):
-        e1 = self.cnn1(grad_conv1)
-        e2 = self.cnn2(grad_conv2)
-        e5 = self.fcn_softmax(softmax_out)
-
-        features = torch.cat([e1, e2, e5], dim=1)
-        out = self.classifier(features)
-        return out
+class GradientMIA(BaseGradientMIA):
+    """
+    Backwards-compatible alias that reuses the modular GradientMIA defined in utils.mia_attack_model.
+    """
+    pass

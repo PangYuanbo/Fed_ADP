@@ -2,9 +2,16 @@
 # mia_attack_utils.py
 # ============================
 
+import math
 import torch
 import torch.nn.functional as F
 import numpy as np
+
+from utils.attack_feature_config import (
+    DEFAULT_ATTACK_FEATURES,
+    FEATURE_SPECS,
+    normalize_attack_features,
+)
 
 # 获取模型输出 + 梯度信息
 def get_model_outputs_labels_and_grads(model, dataloader, device):
@@ -49,8 +56,6 @@ def get_model_outputs_labels_and_grads(model, dataloader, device):
 
     outputs = np.concatenate(outputs_list, axis=0)
     labels = np.concatenate(labels_list, axis=0)
-    outputs = np.concatenate(outputs_list, axis=0)
-    labels = np.concatenate(labels_list, axis=0)
 
     # Validate data consistency
     expected_len = len(outputs)
@@ -61,36 +66,60 @@ def get_model_outputs_labels_and_grads(model, dataloader, device):
 
     return outputs, labels, head_grads, feat_grads
 
-    return outputs, labels, head_grads, feat_grads
+
+def _stack_grad_list(grad_list, name):
+    grads = [torch.tensor(g, dtype=torch.float32) for g in grad_list if g is not None]
+    if not grads:
+        raise ValueError(f"No gradients collected for parameter '{name}'.")
+    return torch.stack(grads, dim=0)
+
+
+def _reshape_tensor(tensor):
+    batch = tensor.shape[0]
+    flat = tensor.view(batch, -1)
+    side = math.ceil(flat.shape[1] ** 0.5)
+    pad = side * side - flat.shape[1]
+    if pad > 0:
+        flat = F.pad(flat, (0, pad), value=0)
+    return flat.view(batch, 1, side, side)
+
+
+def _softmax_tensor(outputs):
+    if isinstance(outputs, torch.Tensor):
+        return F.softmax(outputs, dim=1).clone().detach().float()
+    return F.softmax(torch.from_numpy(outputs), dim=1).float()
+
+
+def _collect_feature_tensors(outputs, head_grads, feat_grads, feature_order):
+    tensors = {}
+    if 'softmax' in feature_order:
+        tensors['softmax'] = _softmax_tensor(outputs)
+    for name in feature_order:
+        spec = FEATURE_SPECS[name]
+        if spec['grad_source'] == 'softmax':
+            continue
+        source = feat_grads if spec['grad_source'] == 'feature' else head_grads
+        grad_list = source[spec['grad_key']]
+        tensors[name] = _reshape_tensor(_stack_grad_list(grad_list, spec['grad_key']))
+    return tensors
 
 # 白盒攻击输入预处理（reshape）
-def prepare_attack_model_inputs(outputs, head_grads, feat_grads):
-    # 修复警告：直接使用outputs（已经是tensor），避免重复转换
-    if isinstance(outputs, torch.Tensor):
-        softmax_out = F.softmax(outputs, dim=1).clone().detach().float()
-    else:
-        softmax_out = F.softmax(torch.from_numpy(outputs), dim=1).float()
-
-    def stack_grads(grad_list):
-        grads = [torch.tensor(g, dtype=torch.float32) for g in grad_list if g is not None]
-        return torch.stack(grads, dim=0)
-
-    grad_conv1 = stack_grads(feat_grads['conv1.0.weight'])
-    grad_conv2 = stack_grads(feat_grads['conv2.0.weight'])
-    grad_fc1   = stack_grads(feat_grads['fc1.0.weight'])
-    grad_fc = stack_grads(head_grads['weight'])  # ✅ 正确的 key
-
-
-    def reshape_tensor(tensor):
-        B = tensor.shape[0]
-        flat = tensor.view(B, -1)
-        side = int(flat.shape[1] ** 0.5)
-        if side * side != flat.shape[1]:
-            pad = side * side - flat.shape[1]
-            flat = F.pad(flat, (0, pad), value=0)
-        return flat.view(B, 1, side, side)
-
-    return reshape_tensor(grad_conv1), reshape_tensor(grad_conv2), reshape_tensor(grad_fc1), reshape_tensor(grad_fc), softmax_out
+def prepare_attack_model_inputs(outputs,
+                                head_grads,
+                                feat_grads,
+                                enabled_features=None,
+                                return_dict=False):
+    feature_order = normalize_attack_features(enabled_features) if return_dict else DEFAULT_ATTACK_FEATURES
+    tensors = _collect_feature_tensors(outputs, head_grads, feat_grads, feature_order)
+    if return_dict:
+        return {name: tensors[name] for name in feature_order}
+    return (
+        tensors['conv1'],
+        tensors['conv2'],
+        tensors['fc1'],
+        tensors['fc'],
+        tensors['softmax'],
+    )
 
 
 # ============= GPU优化版本 (5090大显存专用) =============

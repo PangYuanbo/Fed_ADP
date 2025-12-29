@@ -7,9 +7,34 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from pathlib import Path
+import copy
 from torch.utils.data import DataLoader, TensorDataset, Subset, ConcatDataset
 from mia_attack_utils import get_model_outputs_labels_and_grads, prepare_attack_model_inputs
+from utils.attack_feature_config import DEFAULT_ATTACK_FEATURES, FEATURE_SPECS
+from Membership_Inference_Attack.defense_trainer import train_defense_layers
 from data_utils import read_client_data, filter_by_label
+
+
+def _get_attack_feature_order(attack_model):
+    return getattr(attack_model, 'enabled_features', DEFAULT_ATTACK_FEATURES)
+
+
+def _build_attack_dataset(feature_map, label_value, attack_features):
+    tensors = [feature_map[name] for name in attack_features]
+    if not tensors:
+        raise ValueError("No attack features were provided.")
+    count = tensors[0].size(0)
+    label_tensor = torch.full((count,), label_value, dtype=torch.long)
+    return TensorDataset(*tensors, label_tensor)
+
+
+def _batch_to_attack_inputs(batch, attack_features, device):
+    *feature_batches, labels = batch
+    inputs = {
+        name: tensor.to(device)
+        for name, tensor in zip(attack_features, feature_batches)
+    }
+    return inputs, labels.to(device)
 
 
 # ============================
@@ -18,13 +43,14 @@ from data_utils import read_client_data, filter_by_label
 def train_attack_model(attack_model, dataloader, epochs, lr, device):
     optimizer = torch.optim.Adam(attack_model.parameters(), lr=lr)
     loss_fn = nn.BCELoss()
+    attack_features = _get_attack_feature_order(attack_model)
     for epoch in range(epochs):
         attack_model.train()
         total_loss, correct = 0, 0
-        for g1, g2, g3, g4, softmax, labels in dataloader:
-            g1, g2, g3, g4, softmax = g1.to(device), g2.to(device), g3.to(device), g4.to(device), softmax.to(device)
-            labels = labels.float().unsqueeze(1).to(device)
-            preds = attack_model(g1, g2, g3, g4, softmax)
+        for batch in dataloader:
+            feature_inputs, labels = _batch_to_attack_inputs(batch, attack_features, device)
+            labels = labels.float().unsqueeze(1)
+            preds = attack_model(feature_inputs)
             loss = loss_fn(preds, labels)
             optimizer.zero_grad()
             loss.backward()
@@ -48,17 +74,20 @@ def whitebox_membership_inference_attack_pipeline(
     num_clients=5,
     alpha=1,
     heatmap_cfg=None,
+    member_alignment_cfg=None,
+    defense_cfg=None,
 ):
+    attack_features = _get_attack_feature_order(attack_model)
     # ========= 在 whitebox_membership_inference_attack_pipeline 里，先放一个工具函数 =========
     def collect_scores_labels(loader):
         """收集攻击模型的概率分数(scores)与标签(labels)"""
         attack_model.eval()
         all_scores, all_labels = [], []
         with torch.no_grad():
-            for a, b, c, d, sm, lbl in loader:
-                a, b, c, d, sm = [t.to(DEVICE) for t in (a, b, c, d, sm)]
-                lbl = lbl.to(DEVICE).long()
-                scores = attack_model(a, b, c, d, sm).squeeze(1)  # 假定 attack_model 已含 sigmoid
+            for batch in loader:
+                feature_inputs, lbl = _batch_to_attack_inputs(batch, attack_features, DEVICE)
+                lbl = lbl.long()
+                scores = attack_model(feature_inputs).squeeze(1)  # 假定 attack_model 已含 sigmoid
                 all_scores.append(scores.cpu())
                 all_labels.append(lbl.cpu())
         scores = torch.cat(all_scores).numpy()
@@ -144,10 +173,10 @@ def whitebox_membership_inference_attack_pipeline(
         attack_model.eval()
         preds_list, labels_list = [], []
         with torch.no_grad():
-            for a, b, c, d, sm, lbl in loader:
-                a, b, c, d, sm = [t.to(DEVICE) for t in (a, b, c, d, sm)]
-                lbl = lbl.to(DEVICE).float().unsqueeze(1)
-                out = attack_model(a, b, c, d, sm)
+            for batch in loader:
+                feature_inputs, lbl = _batch_to_attack_inputs(batch, attack_features, DEVICE)
+                lbl = lbl.float().unsqueeze(1)
+                out = attack_model(feature_inputs)
                 preds_list.append((out > 0.5).float().cpu())
                 labels_list.append(lbl.cpu())
         p = torch.cat(preds_list).squeeze()  # shape [N]
@@ -180,27 +209,65 @@ def whitebox_membership_inference_attack_pipeline(
             continue
 
         # 加载目标模型
-        target_model.load_state_dict(torch.load(model_file, map_location=DEVICE))
-        target_model.to(DEVICE)
+        client_model = copy.deepcopy(target_model)
+        client_model.load_state_dict(torch.load(model_file, map_location=DEVICE), strict=False)
+        client_model.to(DEVICE)
+        heatmap_note = None
+
+        if defense_cfg and defense_cfg.get('enabled'):
+            layer_opts = defense_cfg.get('layer_options', {})
+            client_model.feature_extractor.install_defense_layers(**layer_opts)
+            train_defense_layers(
+                client_model,
+                attack_model,
+                train_loader,
+                DEVICE,
+                attack_features,
+                defense_cfg,
+                eval_loader=holdout_loader,
+            )
 
         # 5.1.0) 评估分类准确率
-        train_acc   = eval_classification_acc(target_model, train_loader)
-        holdout_acc = eval_classification_acc(target_model, holdout_loader)
+        train_acc   = eval_classification_acc(client_model, train_loader)
+        holdout_acc = eval_classification_acc(client_model, holdout_loader)
 
         # 5.2) 构造成员 / 非成员的 attack 数据
-        outputs, _, head_grads, feat_grads = get_model_outputs_labels_and_grads(
-            target_model, train_loader, DEVICE
+        member_outputs, _, member_head_grads, member_feat_grads = get_model_outputs_labels_and_grads(
+            client_model, train_loader, DEVICE
         )
-        member_target_heatmap = compute_layer_channel0_heatmap(feat_grads, layer_name='conv1.0.weight')
-        g1, g2, g3, g4, sm_in = prepare_attack_model_inputs(outputs, head_grads, feat_grads)
-        data_in = TensorDataset(g1, g2, g3, g4, sm_in, torch.ones(g1.size(0)).long())
+        member_target_heatmap = compute_layer_channel0_heatmap(member_feat_grads, layer_name='conv1.0.weight')
 
-        outputs, _, head_grads, feat_grads = get_model_outputs_labels_and_grads(
-            target_model, holdout_loader, DEVICE
+        holdout_outputs, _, holdout_head_grads, holdout_feat_grads = get_model_outputs_labels_and_grads(
+            client_model, holdout_loader, DEVICE
         )
-        non_member_target_heatmap = compute_layer_channel0_heatmap(feat_grads, layer_name='conv1.0.weight')
-        g1, g2, g3, g4, sm_out = prepare_attack_model_inputs(outputs, head_grads, feat_grads)
-        data_out = TensorDataset(g1, g2, g3, g4, sm_out, torch.zeros(g1.size(0)).long())
+        non_member_target_heatmap = compute_layer_channel0_heatmap(holdout_feat_grads, layer_name='conv1.0.weight')
+
+        apply_member_gradient_alignment(
+            member_head_grads,
+            member_feat_grads,
+            holdout_head_grads,
+            holdout_feat_grads,
+            attack_features,
+            member_alignment_cfg,
+        )
+
+        member_features = prepare_attack_model_inputs(
+            member_outputs,
+            member_head_grads,
+            member_feat_grads,
+            enabled_features=attack_features,
+            return_dict=True,
+        )
+        data_in = _build_attack_dataset(member_features, 1, attack_features)
+
+        non_member_features = prepare_attack_model_inputs(
+            holdout_outputs,
+            holdout_head_grads,
+            holdout_feat_grads,
+            enabled_features=attack_features,
+            return_dict=True,
+        )
+        data_out = _build_attack_dataset(non_member_features, 0, attack_features)
 
         data_all = DataLoader(ConcatDataset([data_in, data_out]),
                               batch_size=BATCH_SIZE, shuffle=True)
@@ -215,10 +282,16 @@ def whitebox_membership_inference_attack_pipeline(
         tps_recall = float(attack_metrics['tpr'])  # TPR：成员识别率
         fps_err = float(attack_metrics['fpr'])  # FPR：非成员误报率
 
-        if heatmap_cfg:
+        defense_active = defense_cfg and defense_cfg.get('enabled')
+        if defense_active:
+            heatmap_note = "skipped (defense enabled)"
+        if heatmap_cfg and not defense_active:
             enabled_clients = heatmap_cfg.get('enabled_clients')
             should_generate_heatmap = enabled_clients is None or client_idx in enabled_clients
             if should_generate_heatmap:
+                save_root = Path(heatmap_cfg.get('save_root', 'Membership_Inference_Attack/view_heatmaps'))
+                prefix_template = heatmap_cfg.get('name_template', 'client{client}_label{label}')
+                prefix_name = prefix_template.format(client=client_idx, label=target_label)
                 generate_mia_saliency_visuals(
                     member_loader=data_tps,
                     non_member_loader=data_fps,
@@ -227,10 +300,12 @@ def whitebox_membership_inference_attack_pipeline(
                     cfg=heatmap_cfg,
                     client_idx=client_idx,
                     target_label=target_label,
+                    attack_features=attack_features,
                     target_member_heatmap=member_target_heatmap,
                     target_non_member_heatmap=non_member_target_heatmap,
                     conv1_weight_shape=conv1_weight_shape,
                 )
+                heatmap_note = f"{save_root / f'label_{target_label}'} (prefix '{prefix_name}')"
 
         # 6) 汇总结果（建议别把 train_acc 与 holdout_acc 平均；分别保留）
         client_results.append({
@@ -240,13 +315,8 @@ def whitebox_membership_inference_attack_pipeline(
             'f_score': attack_fscore,
             'tpr': tps_recall,
             'fpr': fps_err,
+            'heatmap_info': heatmap_note,
         })
-        print(
-            f"[Client: {model_file}] "
-            f"Train Acc: {train_acc:.4f} | Holdout Acc: {holdout_acc:.4f} | "
-            f"Attack F1: {attack_fscore:.4f} | TPR: {tps_recall:.4f} | FPR: {fps_err:.4f}"
-        )
-
     return client_results
 
 
@@ -382,7 +452,7 @@ def plot_attack_results_last_vs_fscore(results_by_part, part_names):
         plt.show()
 
 
-def compute_attack_saliency(loader, attack_model, device, max_batches=None):
+def compute_attack_saliency(loader, attack_model, device, attack_features, target_value, max_batches=None):
     attack_model.eval()
     saliency = {}
     sample_total = 0
@@ -390,22 +460,17 @@ def compute_attack_saliency(loader, attack_model, device, max_batches=None):
     for batch_idx, batch in enumerate(loader):
         if max_batches is not None and batch_idx >= max_batches:
             break
-        g1, g2, g3, g4, softmax, _ = batch
-
-        tensors = [
-            ('conv1', g1.to(device)),
-            ('conv2', g2.to(device)),
-            ('fc1', g3.to(device)),
-            ('fc', g4.to(device)),
-            ('softmax', softmax.to(device)),
-        ]
-
-        for _, tensor in tensors:
+        *feature_batches, _ = batch
+        tensors = []
+        for name, tensor in zip(attack_features, feature_batches):
+            tensor = tensor.to(device)
             tensor.requires_grad_(True)
+            tensors.append((name, tensor))
 
-        logits = attack_model(*[tensor for _, tensor in tensors])
-        loss = logits.mean()
         attack_model.zero_grad()
+        logits = attack_model({name: tensor for name, tensor in tensors})
+        target = torch.full_like(logits, fill_value=target_value)
+        loss = F.binary_cross_entropy_with_logits(logits, target)
         loss.backward()
 
         for name, tensor in tensors:
@@ -428,7 +493,7 @@ def compute_attack_saliency(loader, attack_model, device, max_batches=None):
     return saliency
 
 
-def compute_attack_input_statistics(loader, max_batches=None):
+def compute_attack_input_statistics(loader, attack_features, max_batches=None):
     stats = {}
     sample_total = 0
 
@@ -436,16 +501,10 @@ def compute_attack_input_statistics(loader, max_batches=None):
         if max_batches is not None and batch_idx >= max_batches:
             break
 
-        g1, g2, g3, g4, softmax, _ = batch
-        tensors = [
-            ('conv1', g1),
-            ('conv2', g2),
-            ('fc1', g3),
-            ('fc', g4),
-            ('softmax', softmax),
-        ]
+        *feature_batches, _ = batch
+        tensors = list(zip(attack_features, feature_batches))
 
-        batch_size = g1.size(0)
+        batch_size = feature_batches[0].size(0)
         sample_total += batch_size
 
         for name, tensor in tensors:
@@ -458,6 +517,70 @@ def compute_attack_input_statistics(loader, max_batches=None):
         stats[key] = stats[key] / sample_total
 
     return stats
+
+
+def _grad_list_abs_mean(grad_list):
+    values = []
+    for g in grad_list:
+        if g is None:
+            continue
+        if isinstance(g, torch.Tensor):
+            arr = g.detach()
+        else:
+            arr = torch.tensor(g)
+        if arr.numel() == 0:
+            continue
+        values.append(arr.abs().mean().item())
+    if not values:
+        return 0.0
+    return float(np.mean(values))
+
+
+def apply_member_gradient_alignment(member_head_grads,
+                                    member_feat_grads,
+                                    ref_head_grads,
+                                    ref_feat_grads,
+                                    attack_features,
+                                    cfg):
+    if not cfg or not cfg.get('enabled'):
+        return
+    epsilon = cfg.get('epsilon', 1e-8)
+    min_scale = cfg.get('min_scale', 1e-2)
+    max_scale = cfg.get('max_scale', 1e2)
+    verbose = cfg.get('verbose', False)
+
+    for feature_name in attack_features:
+        spec = FEATURE_SPECS.get(feature_name)
+        if spec is None:
+            continue
+        if spec['grad_source'] == 'softmax':
+            continue
+        src_member = member_feat_grads if spec['grad_source'] == 'feature' else member_head_grads
+        src_ref = ref_feat_grads if spec['grad_source'] == 'feature' else ref_head_grads
+        key = spec['grad_key']
+        member_list = src_member.get(key)
+        ref_list = src_ref.get(key)
+        if not member_list or not ref_list:
+            continue
+
+        member_mean = _grad_list_abs_mean(member_list)
+        ref_mean = _grad_list_abs_mean(ref_list)
+        if member_mean <= 0:
+            continue
+        scale = ref_mean / max(member_mean, epsilon) if ref_mean > 0 else 1.0
+        scale = max(min_scale, min(max_scale, scale))
+
+        if abs(scale - 1.0) < 1e-6:
+            continue
+
+        for idx, grad in enumerate(member_list):
+            if grad is None:
+                continue
+            member_list[idx] = grad * scale
+
+        if verbose:
+            print(f"[GradAlign] Feature={feature_name} mean_member={member_mean:.4e} "
+                  f"mean_ref={ref_mean:.4e} scale={scale:.4f}")
 
 
 def compute_layer_channel0_heatmap(grad_dict, layer_name):
@@ -498,7 +621,7 @@ def extract_channel0_from_saliency(saliency_tensor, conv_shape):
     return conv.mean(dim=1).cpu()
 
 
-def log_saliency_layer_means(member_saliency, non_member_saliency):
+def log_saliency_layer_means(member_saliency, non_member_saliency, member_label='member_target', non_member_label='non_member_target'):
     def mean_or_none(tensor):
         if tensor is None:
             return None
@@ -512,8 +635,8 @@ def log_saliency_layer_means(member_saliency, non_member_saliency):
         mem_avg = mean_or_none(member_saliency.get(name))
         non_avg = mean_or_none(non_member_saliency.get(name))
         print(
-            f"[Heatmap-Avg] Layer={name} member_avg={mem_avg if mem_avg is not None else 'N/A'} "
-            f"non_member_avg={non_avg if non_avg is not None else 'N/A'}"
+            f"[Heatmap-Avg] Layer={name} {member_label}={mem_avg if mem_avg is not None else 'N/A'} "
+            f"{non_member_label}={non_avg if non_avg is not None else 'N/A'}"
         )
 
 
@@ -522,8 +645,12 @@ def save_saliency_heatmaps(member_saliency,
                           diff_saliency,
                           prefix,
                           save_root,
-                          extra_heatmaps=None):
+                          extra_heatmaps=None,
+                          target_label=None):
     save_root = Path(save_root)
+    # 如果提供了 target_label，创建按 label 分类的子文件夹
+    if target_label is not None:
+        save_root = save_root / f"label_{target_label}"
     save_root.mkdir(parents=True, exist_ok=True)
 
     import matplotlib
@@ -570,6 +697,7 @@ def generate_mia_saliency_visuals(member_loader,
                                  cfg,
                                  client_idx,
                                  target_label,
+                                 attack_features,
                                  target_member_heatmap=None,
                                  target_non_member_heatmap=None,
                                  conv1_weight_shape=None):
@@ -578,40 +706,112 @@ def generate_mia_saliency_visuals(member_loader,
     prefix_template = cfg.get('name_template', 'client{client}_label{label}')
     prefix = prefix_template.format(client=client_idx, label=target_label)
 
-    member_saliency = compute_attack_saliency(member_loader, attack_model, device, max_batches)
-    non_member_saliency = compute_attack_saliency(non_member_loader, attack_model, device, max_batches)
-    log_saliency_layer_means(member_saliency, non_member_saliency)
+    member_input_stats = compute_attack_input_statistics(
+        member_loader,
+        attack_features,
+        max_batches=max_batches,
+    )
+    non_member_input_stats = {}
+    if non_member_loader is not None:
+        non_member_input_stats = compute_attack_input_statistics(
+            non_member_loader,
+            attack_features,
+            max_batches=max_batches,
+        )
+
+    log_saliency_layer_means(
+        member_input_stats,
+        non_member_input_stats,
+        member_label='member_input_magnitude',
+        non_member_label='non_member_input_magnitude',
+    )
+    input_diff = {}
+    for key, tensor in member_input_stats.items():
+        other = non_member_input_stats.get(key)
+        if other is None:
+            input_diff[key] = tensor.clone()
+        else:
+            input_diff[key] = (tensor - other).abs()
+
+    save_saliency_heatmaps(
+        member_input_stats,
+        non_member_input_stats,
+        input_diff,
+        f"{prefix}_raw_inputs",
+        save_root,
+        extra_heatmaps=None,
+        target_label=target_label,
+    )
+
+    member_actual = compute_attack_saliency(member_loader, attack_model, device, attack_features, target_value=1, max_batches=max_batches)
+    member_flipped = compute_attack_saliency(member_loader, attack_model, device, attack_features, target_value=0, max_batches=max_batches)
+    log_saliency_layer_means(member_actual, member_flipped, member_label='member_actual', non_member_label='member_flipped')
 
     diff_saliency = {}
-    for key, tensor in member_saliency.items():
-        other = non_member_saliency.get(key)
+    for key, tensor in member_actual.items():
+        other = member_flipped.get(key)
         if other is None:
             diff_saliency[key] = tensor.clone()
         else:
-            diff_saliency[key] = (tensor - other).clamp(min=0)
+            diff_saliency[key] = (tensor - other).abs()
 
     extra_maps = {}
 
-    if target_member_heatmap is not None:
-        for channel_idx, heat in enumerate(target_member_heatmap):
-            extra_maps[f"channel{channel_idx:02d}_target_conv1_member"] = heat
-    if target_non_member_heatmap is not None:
-        for channel_idx, heat in enumerate(target_non_member_heatmap):
-            extra_maps[f"channel{channel_idx:02d}_target_conv1_non_member"] = heat
+    def add_aggregated_map(name, tensor):
+        if tensor is None:
+            return
+        agg = tensor.mean(dim=0, keepdim=True)
+        extra_maps[name] = agg
 
-    if conv1_weight_shape is not None:
-        member_channels = extract_channel0_from_saliency(member_saliency.get('conv1'), conv1_weight_shape)
-        non_member_channels = extract_channel0_from_saliency(non_member_saliency.get('conv1'), conv1_weight_shape)
-        if member_channels is not None:
-            for channel_idx, heat in enumerate(member_channels):
-                extra_maps[f"channel{channel_idx:02d}_attack_conv1_member"] = heat
-        if non_member_channels is not None:
-            for channel_idx, heat in enumerate(non_member_channels):
-                extra_maps[f"channel{channel_idx:02d}_attack_conv1_non_member"] = heat
+    add_aggregated_map("target_conv1_member", target_member_heatmap)
+    add_aggregated_map("target_conv1_non_member", target_non_member_heatmap)
 
-    save_saliency_heatmaps(member_saliency,
-                           non_member_saliency,
+    # NOTE: Disable per-channel attack conv1 export for now; re-enable when needed.
+    # if conv1_weight_shape is not None:
+    #     member_channels = extract_channel0_from_saliency(member_actual.get('conv1'), conv1_weight_shape)
+    #     flipped_channels = extract_channel0_from_saliency(member_flipped.get('conv1'), conv1_weight_shape)
+    #     add_aggregated_map("attack_conv1_member", member_channels)
+    #     add_aggregated_map("attack_conv1_non_member", flipped_channels)
+
+    save_saliency_heatmaps(member_actual,
+                           member_flipped,
                            diff_saliency,
                            prefix,
                            save_root,
-                           extra_heatmaps=extra_maps)
+                           extra_heatmaps=extra_maps,
+                           target_label=target_label)
+
+    if non_member_loader is not None:
+        holdout_actual = compute_attack_saliency(non_member_loader, attack_model, device, attack_features, target_value=0, max_batches=max_batches)
+        holdout_flipped = compute_attack_saliency(non_member_loader, attack_model, device, attack_features, target_value=1, max_batches=max_batches)
+        log_saliency_layer_means(holdout_actual, holdout_flipped, member_label='holdout_actual', non_member_label='holdout_flipped')
+        diff_holdout = {}
+        for key, tensor in holdout_actual.items():
+            other = holdout_flipped.get(key)
+            if other is None:
+                diff_holdout[key] = tensor.clone()
+            else:
+                diff_holdout[key] = (tensor - other).abs()
+        save_saliency_heatmaps(holdout_actual,
+                               holdout_flipped,
+                               diff_holdout,
+                               f"{prefix}_holdout_flip",
+                               save_root,
+                               extra_heatmaps=None,
+                               target_label=target_label)
+
+        dataset_diff = {}
+        for key, tensor in member_actual.items():
+            other = holdout_actual.get(key)
+            if other is None:
+                dataset_diff[key] = tensor.clone()
+            else:
+                dataset_diff[key] = (tensor - other).abs()
+        log_saliency_layer_means(member_actual, holdout_actual, member_label='member_actual', non_member_label='holdout_actual')
+        save_saliency_heatmaps(member_actual,
+                               holdout_actual,
+                               dataset_diff,
+                               f"{prefix}_dataset",
+                               save_root,
+                               extra_heatmaps=None,
+                               target_label=target_label)

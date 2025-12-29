@@ -206,3 +206,5 @@ Thumbs.db
 /.tmp.drivedownload/
 /system/fedsel_lab/experiments/
 /system/Membership_Inference_Attack/Membership_Inference_Attack/view_heatmaps/
+/system/Membership_Inference_Attack/Membership_Inference_Attack/
+/dataset/

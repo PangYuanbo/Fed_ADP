@@ -34,9 +34,9 @@ class clientCP:
         self.round = 0
 
         # DP阈值参数（支持外部配置）
-        self.threshold_high = getattr(args, 'threshold_high', 0.6)
-        self.threshold_low = getattr(args, 'threshold_low', 0.4)
-        self.clip_value = getattr(args, 'clip_value', 0.005)
+        self.threshold_high = getattr(args, 'threshold_high', 0.8)
+        self.threshold_low = getattr(args, 'threshold_low', 0.2)
+        self.clip_value = getattr(args, 'clip_value', 5)
         self.epsilon = getattr(args, 'epsilon', 0.8)
         self.delta = getattr(args, 'delta', 1e-5)
         self.global_noise = getattr(args, 'global_noise', False)
@@ -585,6 +585,7 @@ class clientCP:
                 elif self.global_noise or self.layer_noise_mode == 'global':
                     # 全局加噪：对所有选中层的所有参数添加噪声
                     core_mask = torch.ones_like(diff, dtype=torch.bool)
+                    print(1)
                 else:
                     # 原始的threshold-based选择性加噪（在选中的层内）
                     # 使用可配置的阈值参数

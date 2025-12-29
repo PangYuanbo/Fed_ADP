@@ -161,7 +161,7 @@ if __name__ == "__main__":
                         help="Compute Hessian (second-order gradient) every N rounds (default: 5)")
 
     args = parser.parse_args()
-    
+
     
     print("dp", args.difference_privacy)
     print("MIA evaluation enabled:", args.enable_mia)

@@ -1,4 +1,12 @@
+import os
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.append(str(PROJECT_ROOT))
+
 from utils.mia_attack_model import GradientMIA
+from utils.attack_feature_config import attack_checkpoint_name
 
 # ============================
 # run_mia_pipeline.py
@@ -6,29 +14,49 @@ from utils.mia_attack_model import GradientMIA
 if __name__ == "__main__":
     import torch
     import copy
-    from model import FedAvgCNN, LocalModel
-    from whitebox_mia_pipeline import  whitebox_membership_inference_attack_pipeline, plot_attack_results_last_vs_fscore
-    from train_attack_model import train_attack_model
-    from evaluate_client_accuracy import evaluate_all_clients_accuracy
+    from Membership_Inference_Attack.model import FedAvgCNN, LocalModel
+    from Membership_Inference_Attack.whitebox_mia_pipeline import  whitebox_membership_inference_attack_pipeline, plot_attack_results_last_vs_fscore
+    from Membership_Inference_Attack.train_attack_model import train_attack_model
+    from Membership_Inference_Attack.evaluate_client_accuracy import evaluate_all_clients_accuracy
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     BATCH_SIZE = 1
-    EPOCHS = 50
+    EPOCHS = 25
     LR = 1e-3
     NUM_CLASSES = 10
     NUM_CLIENTS = 10
     ALPHA = 1
-    TARGET_LABELS = [5]
+    TARGET_LABELS = [5]  # 对所有类别进行攻击评估
     TRAIN_ATTACK_MODELS = True
+    ATTACK_FEATURES = ['fc1','fc']  # 使用的攻击特征集合
     HEATMAP_CFG = {
         "save_root": "Membership_Inference_Attack/view_heatmaps",
-        "enabled_clients": [0],
+        "enabled_clients": None,
         "max_batches": 64,
         "name_template": "client{client}_label{label}",
         "include_member_saliency": True,
         "include_non_member_saliency": False,
-        "include_diff_saliency": False,
+        "include_diff_saliency": False ,
         "include_target_gradient_maps": True,
         "target_gradient_max_batches": 64,
+    }
+    MEMBER_GRAD_ALIGNMENT = {
+        "enabled": True,
+        "epsilon": 1e-8,
+        "min_scale": 0.1,
+        "max_scale": 10.0,
+        "verbose": False,
+    }
+    DEFENSE_CFG = {
+        "enabled": True,
+        "epochs": 10,
+        "lr": 1e-3,
+        "max_batches": 128,
+        "layer_options": {
+            "kernel_size": 3,
+            "padding": 1,
+            "bias": False,
+            "init_std": 1e-3,
+        },
     }
     # 构建目标模型结构（全复制）
     def get_fresh_model():
@@ -47,7 +75,7 @@ if __name__ == "__main__":
 
 
 
-    # #
+    # # #
     # if TRAIN_ATTACK_MODELS:
     #     for target_label in TARGET_LABELS:
     #         print(f"==== Training Attack Model for Label: {target_label} ====")
@@ -62,6 +90,7 @@ if __name__ == "__main__":
     #             lr=LR,
     #             num_clients=NUM_CLIENTS,
     #             alpha=ALPHA,
+    #             attack_features=ATTACK_FEATURES,
     #         )
 
     # 构造 target 模型文件名（多个版本用于不同结构对比）
@@ -69,8 +98,8 @@ if __name__ == "__main__":
     target_client_files = {
         name: [
             # f"dp_model/{ALPHA}/client_{i}_model_50_C1.0_tau0.1.pt"
-            # f"dp_model/{ALPHA}/results_client{i}_1000{name}.pt"
-            f"normal_model/{ALPHA}/results_cifar-10-normal_client{i}_1000_0.0050.pt"
+            f"dp_model/{ALPHA}/results_client{i}_500{name}.pt"
+            # f"normal_model/{ALPHA}/results_cifar-10-normal_client{i}_1000_0.0050.pt"
             for i in range(NUM_CLIENTS)
         ] for name in target_model_names
     }
@@ -101,8 +130,13 @@ if __name__ == "__main__":
     # ---------------------------------------------
     for target_label in TARGET_LABELS:
         print(f"==== Evaluating Attack on Target Label: {target_label} ====")
-        attack_model = GradientMIA().to(DEVICE)
-        attack_model.load_state_dict(torch.load(f"attack_model{target_label}.pth"))
+        attack_model = GradientMIA(enabled_features=ATTACK_FEATURES).to(DEVICE)
+        checkpoint_name = attack_checkpoint_name(target_label, ATTACK_FEATURES)
+        fallback_name = attack_checkpoint_name(target_label, ATTACK_FEATURES, include_suffix=False)
+        if os.path.exists(checkpoint_name):
+            attack_model.load_state_dict(torch.load(checkpoint_name))
+        else:
+            attack_model.load_state_dict(torch.load(fallback_name))
         attack_model.eval()
 
         for part_idx, name in enumerate(target_model_names):
@@ -119,6 +153,8 @@ if __name__ == "__main__":
                 num_clients=NUM_CLIENTS,
                 alpha=ALPHA,
                 heatmap_cfg=HEATMAP_CFG,
+                member_alignment_cfg=MEMBER_GRAD_ALIGNMENT,
+                defense_cfg=DEFENSE_CFG,
             )
 
             # 按 client 聚合，再按 label 压入同一 client 的列表里
@@ -132,3 +168,19 @@ if __name__ == "__main__":
 
     # plot_attack_results_per_client(all_results_by_part, target_model_names)
     plot_attack_results_last_vs_fscore(all_results_by_part, target_model_names)
+
+    for part_idx, part_name in enumerate(target_model_names):
+        print(f"\n=== Summary for Target Model Set: {part_name} ===")
+        for client_idx, label_results in enumerate(all_results_by_part[part_idx]):
+            for result in label_results:
+                heatmap_note = result.get('heatmap_info')
+                heatmap_str = f" | Heatmap: {heatmap_note}" if heatmap_note else ""
+                print(
+                    f"[Client {client_idx}] Label {TARGET_LABELS[label_results.index(result)]} | "
+                    f"Train Acc: {result['train_acc']:.4f} | "
+                    f"Holdout Acc: {result['holdout_acc']:.4f} | "
+                    f"Attack F1: {result['f_score']:.4f} | "
+                    f"TPR: {result['tpr']:.4f} | "
+                    f"FPR: {result['fpr']:.4f}"
+                    f"{heatmap_str}"
+                )

@@ -8,6 +8,7 @@ import copy
 import os
 from model import FedAvgCNN, LocalModel, GradientMIA
 from train_attack_model import train_attack_model
+from utils.attack_feature_config import attack_checkpoint_name
 
 # 配置参数
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -17,6 +18,7 @@ LR = 5e-4  # 降低学习率以提高训练稳定性 (原来1e-3)
 NUM_CLASSES = 10
 NUM_CLIENTS = 5  # 你训练了5个客户端模型
 ALPHA = 1.0
+ATTACK_FEATURES = ['conv1', 'conv2', 'fc1', 'fc', 'softmax']
 
 # 构建模型结构
 def get_fresh_model():
@@ -117,13 +119,17 @@ if __name__ == "__main__":
             epochs=EPOCHS,
             lr=LR,
             num_clients=NUM_CLIENTS,
-            alpha=ALPHA
+            alpha=ALPHA,
+            attack_features=ATTACK_FEATURES,
         )
 
         # 检查是否成功保存
-        attack_model_path = f"attack_model{target_label}.pth"
+        attack_model_path = attack_checkpoint_name(target_label, ATTACK_FEATURES)
+        legacy_path = attack_checkpoint_name(target_label, ATTACK_FEATURES, include_suffix=False)
         if os.path.exists(attack_model_path):
             print(f"✓ Attack model for label {target_label} saved to: {attack_model_path}")
+        elif os.path.exists(legacy_path):
+            print(f"✓ Attack model for label {target_label} saved to legacy path: {legacy_path}")
         else:
             print(f"✗ Warning: Attack model for label {target_label} may not have been saved properly")
 
@@ -134,12 +140,16 @@ if __name__ == "__main__":
     # 列出所有生成的攻击模型
     print("\nGenerated attack models:")
     for target_label in range(NUM_CLASSES):
-        attack_model_path = f"attack_model{target_label}.pth"
+        attack_model_path = attack_checkpoint_name(target_label, ATTACK_FEATURES)
+        legacy_path = attack_checkpoint_name(target_label, ATTACK_FEATURES, include_suffix=False)
         if os.path.exists(attack_model_path):
             size_mb = os.path.getsize(attack_model_path) / (1024 * 1024)
             print(f"  ✓ {attack_model_path} ({size_mb:.2f} MB)")
+        elif os.path.exists(legacy_path):
+            size_mb = os.path.getsize(legacy_path) / (1024 * 1024)
+            print(f"  ✓ {legacy_path} ({size_mb:.2f} MB)")
         else:
-            print(f"  ✗ {attack_model_path} (missing)")
+            print(f"  ✗ {attack_checkpoint_name(target_label, ATTACK_FEATURES)} (missing)")
 
     print("\n[INFO] You can now use these attack models to evaluate membership inference attacks")
     print("[INFO] on target models using the whitebox_mia_pipeline.py")

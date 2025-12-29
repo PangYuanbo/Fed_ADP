@@ -18,6 +18,11 @@ from .model import FedAvgCNN, LocalModel, GradientMIA
 from .whitebox_mia_pipeline import whitebox_membership_inference_attack_pipeline
 from .train_attack_model import train_attack_model
 from .evaluate_client_accuracy import evaluate_all_clients_accuracy
+from utils.attack_feature_config import (
+    DEFAULT_ATTACK_FEATURES,
+    attack_checkpoint_name,
+    normalize_attack_features,
+)
 
 
 class MIAAttackInterface:
@@ -62,6 +67,8 @@ class MIAAttackInterface:
             'attack_lr': 1e-3,
             'model_dim': 1600,
             'model_in_features': 3,
+            'attack_model_dir': ".",
+            'attack_features': DEFAULT_ATTACK_FEATURES.copy(),
         }
 
     def _get_fresh_model(self):
@@ -75,6 +82,14 @@ class MIAAttackInterface:
         head = copy.deepcopy(base.fc)
         base.fc = torch.nn.Identity()
         return LocalModel(base, head)
+
+    def _normalize_attack_features(self, config):
+        return normalize_attack_features(config.get('attack_features'))
+
+    def _attack_model_paths(self, label, attack_model_dir, attack_features):
+        primary = os.path.join(attack_model_dir, attack_checkpoint_name(label, attack_features))
+        legacy = os.path.join(attack_model_dir, attack_checkpoint_name(label, attack_features, include_suffix=False))
+        return primary, legacy
 
     def run_mia_attack(self,
                       target_model_path: str,
@@ -103,6 +118,12 @@ class MIAAttackInterface:
 
         # 合并配置
         merged_config = {**self.default_config, **(config or {})}
+        merged_config['attack_model_dir'] = attack_model_dir
+        attack_features = self._normalize_attack_features(merged_config)
+        merged_config['attack_features'] = attack_features
+        attack_model_dir = merged_config.get('attack_model_dir', '.')
+        attack_features = self._normalize_attack_features(merged_config)
+        merged_config['attack_features'] = attack_features
 
         # 确定要攻击的标签
         target_labels = [target_label] if target_label is not None else list(range(merged_config['num_classes']))
@@ -133,11 +154,12 @@ class MIAAttackInterface:
 
             try:
                 # 检查攻击模型是否存在
-                attack_model_path = os.path.join(attack_model_dir, f"attack_model{label}.pth")
-                if not os.path.exists(attack_model_path):
+                attack_model_path, legacy_path = self._attack_model_paths(label, attack_model_dir, attack_features)
+                chosen_path = attack_model_path if os.path.exists(attack_model_path) else legacy_path
+                if not os.path.exists(chosen_path):
                     self._log(f"Attack model for label {label} not found at {attack_model_path}", 'warning')
                     self._log(f"Training attack model for label {label}", 'info')
-                    train_result = self._train_attack_model_if_needed(label, shadow_model_paths, merged_config, attack_model_dir)
+                    train_result = self._train_attack_model_if_needed(label, shadow_model_paths, merged_config, attack_model_dir, attack_features)
                     if not train_result['success']:
                         errors.append({
                             'label': label,
@@ -145,11 +167,12 @@ class MIAAttackInterface:
                             'message': train_result['error']
                         })
                         continue
+                    chosen_path = attack_model_path if os.path.exists(attack_model_path) else legacy_path
 
                 # 加载攻击模型
-                attack_model = GradientMIA().to(self.device)
-                if os.path.exists(attack_model_path):
-                    attack_model.load_state_dict(torch.load(attack_model_path, map_location=self.device))
+                attack_model = GradientMIA(enabled_features=attack_features, num_classes=merged_config['num_classes']).to(self.device)
+                if os.path.exists(chosen_path):
+                    attack_model.load_state_dict(torch.load(chosen_path, map_location=self.device))
                     attack_model.eval()
                     self._log(f"Attack model for label {label} loaded successfully", 'info')
                 else:
@@ -333,6 +356,9 @@ class MIAAttackInterface:
                             lr=merged_config['attack_lr'],
                             num_clients=len(shadow_model_paths),
                             alpha=merged_config['alpha'],
+                            attack_features=attack_features,
+                            checkpoint_dir=attack_model_dir,
+                            num_classes=merged_config['num_classes'],
                         )
                     self._log(f"Attack model for label {target_label} trained successfully", 'info')
                 except Exception as e:
@@ -353,10 +379,11 @@ class MIAAttackInterface:
 
             try:
                 # 加载攻击模型
-                attack_model = GradientMIA().to(self.device)
-                attack_model_path = f"attack_model{target_label}.pth"
-                if os.path.exists(attack_model_path):
-                    attack_model.load_state_dict(torch.load(attack_model_path, map_location=self.device))
+                attack_model = GradientMIA(enabled_features=attack_features, num_classes=merged_config['num_classes']).to(self.device)
+                attack_model_path, legacy_path = self._attack_model_paths(target_label, attack_model_dir, attack_features)
+                chosen_path = attack_model_path if os.path.exists(attack_model_path) else legacy_path
+                if os.path.exists(chosen_path):
+                    attack_model.load_state_dict(torch.load(chosen_path, map_location=self.device))
                     attack_model.eval()
                     self._log(f"Attack model for label {target_label} loaded", 'info')
                 else:
@@ -465,7 +492,7 @@ class MIAAttackInterface:
                 'errors': result.get('errors', [])
             }
 
-    def _train_attack_model_if_needed(self, target_label, shadow_model_paths, config, save_dir):
+    def _train_attack_model_if_needed(self, target_label, shadow_model_paths, config, save_dir, attack_features):
         """如果需要，训练攻击模型"""
         try:
             self._log(f"Training attack model for label {target_label}", 'info')
@@ -483,15 +510,13 @@ class MIAAttackInterface:
                     lr=config['attack_lr'],
                     num_clients=len(shadow_model_paths),
                     alpha=config['alpha'],
+                    attack_features=attack_features,
+                    checkpoint_dir=save_dir,
+                    num_classes=config['num_classes'],
                 )
 
-            # 移动训练好的模型到指定目录
-            src_path = f"attack_model{target_label}.pth"
-            dst_path = os.path.join(save_dir, f"attack_model{target_label}.pth")
-            if os.path.exists(src_path) and src_path != dst_path:
-                os.makedirs(save_dir, exist_ok=True)
-                os.rename(src_path, dst_path)
-                self._log(f"Attack model for label {target_label} saved to {dst_path}", 'info')
+            checkpoint_path = os.path.join(save_dir, attack_checkpoint_name(target_label, attack_features))
+            self._log(f"Attack model for label {target_label} saved to {checkpoint_path}", 'info')
 
             return {'success': True}
 
