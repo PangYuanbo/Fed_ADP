@@ -133,6 +133,11 @@ def whitebox_membership_inference_attack_pipeline(
     holdout_datasets = read_client_data(is_train=False, is_shadow=False,
                                         num_clients=num_clients, alpha=alpha)
 
+    train_full_loaders = [DataLoader(ds, batch_size=BATCH_SIZE, shuffle=False)
+                         for ds in train_datasets]
+    holdout_full_loaders = [DataLoader(ds, batch_size=BATCH_SIZE, shuffle=False)
+                            for ds in holdout_datasets]
+
     # 2) 仅保留指定 label 的子集
     train_datasets_filtered = [filter_by_label(ds, target_label) for ds in train_datasets]
     holdout_datasets_filtered = [filter_by_label(ds, target_label) for ds in holdout_datasets]
@@ -200,8 +205,8 @@ def whitebox_membership_inference_attack_pipeline(
     except Exception:
         pass
 
-    for client_idx, (model_file, train_loader, holdout_loader) in enumerate(
-        zip(client_files, train_loaders, holdout_loaders)
+    for client_idx, (model_file, train_loader, holdout_loader, full_train_loader, full_holdout_loader) in enumerate(
+        zip(client_files, train_loaders, holdout_loaders, train_full_loaders, holdout_full_loaders)
     ):
         # 跳过空数据
         if len(train_loader.dataset) == 0 or len(holdout_loader.dataset) == 0:
@@ -224,7 +229,8 @@ def whitebox_membership_inference_attack_pipeline(
                 DEVICE,
                 attack_features,
                 defense_cfg,
-                eval_loader=holdout_loader,
+                classification_loader=full_train_loader,
+                eval_loader=full_holdout_loader,
             )
 
         # 5.1.0) 评估分类准确率

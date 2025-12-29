@@ -113,7 +113,7 @@ def _compute_attack_inputs_with_graph(model, batch_x, batch_y, attack_features):
                 tensor = tensor.requires_grad_()
             feature_tensors[name] = tensor
 
-    return feature_tensors
+    return feature_tensors, logits
 
 
 def _binary_f1(preds, targets, threshold=0.5):
@@ -154,6 +154,7 @@ def train_defense_layers(model,
                          device,
                          attack_features,
                          cfg,
+                         classification_loader=None,
                          eval_loader=None):
     if not cfg or not cfg.get('enabled'):
         return
@@ -173,6 +174,8 @@ def train_defense_layers(model,
     for p in model.head.parameters():
         p.requires_grad = False
 
+    classification_iter = iter(classification_loader) if classification_loader is not None else None
+
     step = 0
     last_loss = None
     for epoch in range(epochs):
@@ -184,7 +187,7 @@ def train_defense_layers(model,
             optimizer.zero_grad()
             model.zero_grad()
 
-            feature_inputs = _compute_attack_inputs_with_graph(
+            feature_inputs, logits = _compute_attack_inputs_with_graph(
                 model,
                 batch_x,
                 batch_y,
@@ -192,7 +195,24 @@ def train_defense_layers(model,
             )
             attack_out = attack_model(feature_inputs)
             target = torch.zeros_like(attack_out)
-            loss = F.binary_cross_entropy_with_logits(attack_out, target)
+            defense_loss = F.binary_cross_entropy_with_logits(attack_out, target)
+            lambda_def = cfg.get('lambda_defense', 1.0)
+            lambda_cls = cfg.get('lambda_classification', 0.0)
+            cls_loss = torch.tensor(0.0, device=device)
+            if lambda_cls > 0:
+                if classification_loader is not None:
+                    try:
+                        cls_batch_x, cls_batch_y = next(classification_iter)
+                    except StopIteration:
+                        classification_iter = iter(classification_loader)
+                        cls_batch_x, cls_batch_y = next(classification_iter)
+                    cls_batch_x = cls_batch_x.to(device)
+                    cls_batch_y = cls_batch_y.to(device)
+                    cls_logits = model(cls_batch_x)
+                    cls_loss = F.cross_entropy(cls_logits, cls_batch_y)
+                else:
+                    cls_loss = F.cross_entropy(logits, batch_y)
+            loss = lambda_def * defense_loss + lambda_cls * cls_loss
             loss.backward()
             optimizer.step()
             last_loss = loss.item()
@@ -207,7 +227,13 @@ def train_defense_layers(model,
             if eval_loader is not None:
                 acc = _eval_model_accuracy(model, eval_loader, device)
                 acc_note = f" | Acc(after defense)={acc:.4f}"
-            print(f"[Defense] Epoch {epoch+1}/{epochs} Loss={last_loss:.4f} AttackF1~{f1:.4f}{acc_note}")
+            print(
+                f"[Defense] Epoch {epoch+1}/{epochs} "
+                f"Loss={last_loss:.4f} "
+                f"AttackF1~{f1:.4f} "
+                f"(λ_def={lambda_def}, λ_cls={lambda_cls})"
+                f"{acc_note}"
+            )
     for p in attack_model.parameters():
         p.requires_grad = True
     model.feature_extractor.unfreeze_all_parameters()

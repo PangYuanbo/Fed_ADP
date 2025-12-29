@@ -25,9 +25,9 @@ if __name__ == "__main__":
     NUM_CLASSES = 10
     NUM_CLIENTS = 10
     ALPHA = 1
-    TARGET_LABELS = [5]  # 对所有类别进行攻击评估
+    TARGET_LABELS = [0, 1, 2, 3, 4, 5]  # 扩展为 label 0~5
     TRAIN_ATTACK_MODELS = True
-    ATTACK_FEATURES = ['fc1','fc']  # 使用的攻击特征集合
+    ATTACK_FEATURES = ['conv1', 'conv2', 'fc']  # 更换攻击模型分支组合
     HEATMAP_CFG = {
         "save_root": "Membership_Inference_Attack/view_heatmaps",
         "enabled_clients": None,
@@ -48,9 +48,11 @@ if __name__ == "__main__":
     }
     DEFENSE_CFG = {
         "enabled": True,
-        "epochs": 10,
-        "lr": 1e-3,
+        "epochs": 20,
+        "lr": 5e-4,
         "max_batches": 128,
+        "lambda_defense": 0.2,
+        "lambda_classification": 0.8,
         "layer_options": {
             "kernel_size": 3,
             "padding": 1,
