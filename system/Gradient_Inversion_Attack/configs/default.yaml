@@ -1,0 +1,52 @@
+# GI-SMN Attack Default Configuration
+# Author: Fed_ADP Project
+# Reference: Jin Qian et al., "GI-SMN", arXiv:2405.03516, 2024
+
+# Attack Parameters
+num_iterations: 10000          # Total optimization iterations
+learning_rate: 0.01            # Learning rate for latent code optimization
+latent_dim: 64                 # Dimension of StyleGAN-XL latent space
+latent_clamp: 2.0              # Clamp latent codes to [-c, c]
+stage1_ratio: 0.444            # Stage 1 duration (4/9 ≈ 0.444)
+
+# Loss Function Weights
+lambda_tv: 0.001               # Total variation regularization weight
+lambda_l2: 0.0001              # L2 regularization weight
+lambda_group: 0.01             # Group consistency weight (for batch attacks)
+
+# Evaluation Settings
+num_samples_per_client: 5      # Number of samples to reconstruct per client
+save_intermediate: false       # Save intermediate reconstruction results
+save_visuals: true             # Generate visualization plots
+
+# Defense Testing
+test_defense: false            # Whether to test defense mechanisms
+dp_noise_levels:               # DP noise levels to test
+  - 1.0e-05
+  - 0.0001
+  - 0.001
+  - 0.01
+  - 0.1
+clip_values:                   # Gradient clip values to test
+  - 0.001
+  - 0.005
+  - 0.01
+  - 0.05
+  - 0.1
+
+# StyleGAN-XL Model
+stylegan_model_path: 'Gradient_Inversion_Attack/pretrained_models/stylegan_xl_cifar10.pkl'
+img_resolution: 32             # Output image resolution (CIFAR-10: 32x32)
+
+# Results Management
+results_base_dir: 'gia_results'
+create_timestamped_dirs: true
+save_loss_history: true
+save_reconstruction_plots: true
+save_defense_test_plots: true
+
+# Performance
+use_gpu: true
+device: 'cuda'                 # 'cuda' or 'cpu'
+num_workers: 4                 # Data loader workers
+pin_memory: true

@@ -136,6 +136,7 @@ dmypy.json
 /dataset/
 /public_cifar10_data_iid_5percent/
 /system/cifar10_data_main/
+/system/dataset/
 /system/Membership_Inference_Attack/dataset/
 
 # === 训练模型和权重文件 (17GB+) ===
@@ -208,3 +209,4 @@ Thumbs.db
 /system/Membership_Inference_Attack/Membership_Inference_Attack/view_heatmaps/
 /system/Membership_Inference_Attack/Membership_Inference_Attack/
 /dataset/
+/system/pretrain_selective_upload/

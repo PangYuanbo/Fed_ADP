@@ -1,0 +1,59 @@
+{
+  "round": 200,
+  "timestamp": "2025-11-04_22-05-05",
+  "dataset": "cifar-10-normal",
+  "config": {
+    "num_iterations": 10000,
+    "learning_rate": 0.01,
+    "latent_dim": 64,
+    "latent_clamp": 2.0,
+    "stage1_ratio": 0.4444444444444444,
+    "lambda_tv": 0.001,
+    "lambda_l2": 0.0001,
+    "lambda_group": 0.01,
+    "num_samples_per_client": 5,
+    "save_intermediate": false,
+    "save_visuals": true,
+    "test_defense": false,
+    "dp_noise_levels": [
+      1e-05,
+      0.0001,
+      0.001,
+      0.01,
+      0.1
+    ],
+    "clip_values": [
+      0.001,
+      0.005,
+      0.01,
+      0.05,
+      0.1
+    ]
+  },
+  "client_results": {
+    "0": {
+      "status": "error",
+      "message": "element 0 of tensors does not require grad and does not have a grad_fn"
+    },
+    "1": {
+      "status": "error",
+      "message": "element 0 of tensors does not require grad and does not have a grad_fn"
+    },
+    "2": {
+      "status": "error",
+      "message": "element 0 of tensors does not require grad and does not have a grad_fn"
+    },
+    "3": {
+      "status": "error",
+      "message": "element 0 of tensors does not require grad and does not have a grad_fn"
+    },
+    "4": {
+      "status": "error",
+      "message": "element 0 of tensors does not require grad and does not have a grad_fn"
+    }
+  },
+  "summary": {
+    "num_clients": 5,
+    "successful_clients": 0
+  }
+}
